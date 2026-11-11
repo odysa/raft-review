@@ -10,9 +10,13 @@ sentence. The agent then pulls the accepted changes as a `git` patch and commits
 Also works for Markdown, plain text and stand-alone PDFs. Built as a connected **Raft App** for
 [botiverse/raft-source discussion #4](https://github.com/botiverse/raft-source/discussions/4).
 
-![The agent's LaTeX suggestion on a comment made in the PDF](docs/screenshots/paper-2-suggestion.png)
+![A one-minute walkthrough: upload a LaTeX project, comment on the PDF, the agent suggests a LaTeX edit, accept, the PDF recompiles](docs/demo.gif)
 
-> Screenshots are from the app running in Chrome (dev mode), on the example paper in
+*One minute, real time: upload → comment on the PDF (mapped to `main.tex:14`) → the agent replies and
+suggests a LaTeX edit → Accept recompiles the PDF → jump to the source → the patch → an equation mapped to
+its LaTeX. [MP4 version](docs/demo.mp4).*
+
+> The recording and screenshots are from the app running in Chrome (dev mode), on the example paper in
 > [`examples/sparse-routing`](examples/sparse-routing). The agent's side was played over the same HTTP
 > actions that `raft integration invoke` calls.
 

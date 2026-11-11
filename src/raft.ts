@@ -143,6 +143,25 @@ export class RaftClient {
     return json;
   }
 
+  /** Subscribe this App's installation on `serverId` to webhook events.
+   *  Needs the App Notifications webhook configured in Raft (owner/admin) and
+   *  the event groups approved on the installation. */
+  async subscribe(serverId: string, events: readonly string[]): Promise<{ ok: boolean; detail: string }> {
+    const lookup = await this.post("/api/oauth/installations/lookup", { server_id: serverId }, this.basicAuth());
+    if (lookup.status !== 200 || !lookup.json?.installation_id) {
+      return { ok: false, detail: `installation lookup HTTP ${lookup.status}: ${lookup.json?.error ?? ""}` };
+    }
+    const res = await this.fetchImpl(new URL(`/api/oauth/installations/${encodeURIComponent(lookup.json.installation_id)}/subscriptions`, this.config.raftApiUrl), {
+      method: "PUT",
+      headers: { "content-type": "application/json", accept: "application/json", authorization: this.basicAuth() },
+      body: JSON.stringify({ events }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const json: any = await res.json().catch(() => null);
+    if (res.status !== 200) return { ok: false, detail: `subscriptions HTTP ${res.status}: ${json?.error ?? ""}` };
+    return { ok: true, detail: `subscribed: ${(json?.subscribed_events ?? []).join(", ")}` };
+  }
+
   async userinfo(accessToken: string): Promise<RaftUserinfo> {
     const res = await this.fetchImpl(new URL("/api/oauth/userinfo", this.config.raftApiUrl), {
       headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" },

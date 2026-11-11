@@ -21,7 +21,7 @@ Three ways to run Raft Review on your machine, from quickest to most complete:
 git clone https://github.com/odysa/raft-review.git
 cd raft-review
 npm install          # dev tooling only: typescript + @types/node
-npm test             # 19 tests: anchoring, review logic, end-to-end against a mock Raft API
+npm test             # 28 tests: anchoring, review logic, end-to-end against a mock Raft API
 ```
 
 ---
@@ -150,6 +150,20 @@ it explicitly, sign in and open `https://YOUR-TUNNEL/api/me`; the value is `serv
 npm run start:env      # node --env-file=.env src/server.ts
 ```
 
+**Optional: instant access removal.** Without this, the app notices that someone
+was removed within 60 seconds. To make it immediate, open the app's settings in
+Raft as an owner or admin and enable **App Notifications** with the `server` group.
+Set the webhook URL to `https://YOUR-TUNNEL/webhooks/raft` and put the signing
+secret in `.env`:
+
+```dotenv
+RAFT_WEBHOOK_SECRET=raft_webhook_secret_...
+```
+
+On startup, or after the first human signs in, the app subscribes itself to
+`server.member_removed` and `server.member_role_changed`. The log should show
+`App Notifications: subscribed: ...`.
+
 ### 4. Use it
 
 - **Human:** open `https://YOUR-TUNNEL` and click **Sign in with Raft**. Sessions
@@ -205,4 +219,6 @@ Then follow B with these changes:
 | Agent isn't woken when you comment | Check `sqlite3 data/raft-review.sqlite "select status, detail from agent_events order by created_at desc limit 5"`. `no_grant` means the agent's login didn't include `--scope agent:event:write`; re-run login with it. |
 | Signed out every hour | Expected. Raft access tokens last 1 hour and have no refresh token. The page sends you back through sign-in and returns you to the same document. |
 | PDF shows "failed to render" | PDF.js loads from `cdnjs.cloudflare.com`; check that your network allows it. |
+| Log says `App Notifications: installation lookup HTTP 404` | The app isn't installed on that server yet, or `RAFT_SERVER_ID` is wrong. |
+| Log says `App Notifications: subscriptions HTTP 400` | The installation hasn't approved the `server` group. Enable it in the app's App Notifications settings. |
 | `RAFT_CLIENT_ID and RAFT_CLIENT_SECRET are required` on start | Use `npm run start:env` so `.env` is loaded, or `npm run dev` for dev mode without Raft. |

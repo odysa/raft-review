@@ -17,6 +17,8 @@ export interface Config {
   serviceKey: string;
   /** How long a verified identity/membership may be trusted (Raft: ≤ 60 s). */
   membershipTtlMs?: number;
+  /** App Notifications signing secrets (current first; previous during rotation). */
+  webhookSecrets: string[];
 }
 
 function trimSlash(value: string): string {
@@ -37,6 +39,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir: path.resolve(env.DATA_DIR ?? "./data"),
     devLogin,
     serviceKey: env.RAFT_SERVICE_KEY ?? env.RAFT_CLIENT_ID ?? "raft-review",
+    webhookSecrets: (env.RAFT_WEBHOOK_SECRET ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   };
   if (!devLogin && (!config.clientId || !config.clientSecret)) {
     throw new Error("RAFT_CLIENT_ID and RAFT_CLIENT_SECRET are required (or set RAFT_REVIEW_DEV_LOGIN=1 for local development)");

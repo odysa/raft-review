@@ -102,6 +102,20 @@ test("new full version re-anchors threads and orphans vanished ones", () => {
   assert.equal(g.suggestions.find((x) => x.id === s.id)!.status, "stale");
 });
 
+test("edited passage keeps its thread (marked) but its suggestion goes stale", () => {
+  const { db, human, agent } = setup();
+  const doc = createDocument(db, human, { title: "t", filename: "a.md", text: "Intro.\n\nOur model beats every baseline by far.\n\nEnd.", reviewerAgentId: agent.id });
+  const t = createThread(db, human, doc.id, { quote: "Our model beats every baseline by far.", body: "overclaim" });
+  const s = createSuggestion(db, agent, t.id, { replacement: "Our model beats two of three baselines." });
+  addVersion(db, agent, doc.id, { text: "Intro.\n\nOur model beats most baselines by far.\n\nEnd." });
+  const view = documentView(db, human, doc.id);
+  const thread = view.threads[0];
+  assert.equal(thread.status, "open");
+  assert.equal(thread.reanchored, "fuzzy");
+  assert.equal(thread.anchor.quote, "Our model beats most baselines by far.");
+  assert.equal(thread.suggestions.find((x) => x.id === s.id)!.status, "stale");
+});
+
 test("documents are invisible across servers", () => {
   const { db, human, outsider } = setup();
   const doc = createDocument(db, human, { title: "t", filename: "a.md", text: "secret" });

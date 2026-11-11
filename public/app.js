@@ -705,6 +705,7 @@ function threadCard(t) {
   h("div", { class: "loc" },
     h("span", {}, where),
     t.status !== "open" ? h("span", { class: "pill" }, t.status) : null,
+    t.reanchored ? h("span", { class: "pill warn", title: "The passage was edited in a newer version; this comment moved with it." }, "text edited") : null,
     awaiting ? h("span", { class: "pill agent" }, `waiting on @${doc.reviewer.username}`) : null,
     h("span", { style: "flex:1" }),
     t.status === "open"

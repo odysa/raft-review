@@ -101,6 +101,25 @@ function commonPrefixLength(a: string, b: string): number {
  *  distance from the old position. Returns null when the quoted text no longer
  *  exists (the thread becomes orphaned). */
 export function reanchor(text: string, anchor: QuoteAnchor): Span | null {
+  return reanchorDetailed(text, anchor)?.span ?? null;
+}
+
+export type AnchorMatch = "exact" | "fuzzy" | "context";
+
+/** Like `reanchor`, but also says how the anchor was found:
+ *  exact quote → approximate quote (edit distance ≤ 25% of its length, as
+ *  Hypothesis does) → the span between the unchanged prefix and suffix. */
+export function reanchorDetailed(text: string, anchor: QuoteAnchor): { span: Span; match: AnchorMatch } | null {
+  const exact = reanchorExact(text, anchor);
+  if (exact) return { span: exact, match: "exact" };
+  const fuzzy = fuzzyFind(text, anchor);
+  if (fuzzy) return { span: fuzzy, match: "fuzzy" };
+  const bracketed = betweenContext(text, anchor);
+  if (bracketed) return { span: bracketed, match: "context" };
+  return null;
+}
+
+function reanchorExact(text: string, anchor: QuoteAnchor): Span | null {
   if (text.slice(anchor.start, anchor.end) === anchor.quote) return { start: anchor.start, end: anchor.end };
   const hits = quoteOccurrences(text, anchor.quote);
   if (hits.length === 0) return null;
@@ -152,4 +171,136 @@ export function pageOf(text: string, offset: number): number {
   let page = 1;
   for (let i = 0; i < offset && i < text.length; i++) if (text[i] === PAGE_SEPARATOR) page++;
   return page;
+}
+
+// ---------- approximate matching ----------
+
+interface ApproxHit extends Span {
+  errors: number;
+}
+
+/** Semi-global edit-distance search (Sellers' algorithm): every place in
+ *  text[from, to) where `pattern` matches with at most `maxErrors` edits.
+ *  O(pattern × window) time, O(pattern) memory. Starts are tracked through
+ *  the DP so each hit is a full span. */
+export function approxSearch(text: string, pattern: string, maxErrors: number, from = 0, to = text.length): ApproxHit[] {
+  const m = pattern.length;
+  if (m === 0) return [];
+  let prevCost = new Int32Array(m + 1);
+  let prevStart = new Int32Array(m + 1);
+  let curCost = new Int32Array(m + 1);
+  let curStart = new Int32Array(m + 1);
+  for (let j = 0; j <= m; j++) { prevCost[j] = j; prevStart[j] = from; }
+  const hits: ApproxHit[] = [];
+  for (let i = from; i < to; i++) {
+    const ch = text.charCodeAt(i);
+    curCost[0] = 0;
+    curStart[0] = i + 1;
+    for (let j = 1; j <= m; j++) {
+      let cost = prevCost[j - 1] + (pattern.charCodeAt(j - 1) === ch ? 0 : 1);
+      let start = prevStart[j - 1];
+      if (curCost[j - 1] + 1 < cost) { cost = curCost[j - 1] + 1; start = curStart[j - 1]; }
+      if (prevCost[j] + 1 < cost) { cost = prevCost[j] + 1; start = prevStart[j]; }
+      curCost[j] = cost;
+      curStart[j] = start;
+    }
+    if (curCost[m] <= maxErrors) hits.push({ start: curStart[m], end: i + 1, errors: curCost[m] });
+    [prevCost, curCost] = [curCost, prevCost];
+    [prevStart, curStart] = [curStart, prevStart];
+  }
+  return hits;
+}
+
+const FUZZY_MAX_PATTERN = 256;
+const FUZZY_WINDOW = 20_000;
+
+function contextScore(text: string, span: Span, anchor: QuoteAnchor): number {
+  return (anchor.prefix ? commonSuffixLength(text.slice(Math.max(0, span.start - anchor.prefix.length), span.start), anchor.prefix) : 0)
+    + (anchor.suffix ? commonPrefixLength(text.slice(span.end, span.end + anchor.suffix.length), anchor.suffix) : 0);
+}
+
+function bestHit(text: string, hits: ApproxHit[], anchor: QuoteAnchor): ApproxHit | null {
+  let best: ApproxHit | null = null;
+  let bestKey: [number, number, number] = [Infinity, -Infinity, Infinity];
+  for (const hit of hits) {
+    const key: [number, number, number] = [hit.errors, contextScore(text, hit, anchor), Math.abs(hit.start - anchor.start)];
+    if (key[0] < bestKey[0] || (key[0] === bestKey[0] && (key[1] > bestKey[1] || (key[1] === bestKey[1] && key[2] < bestKey[2])))) {
+      best = hit;
+      bestKey = key;
+    }
+  }
+  return best;
+}
+
+/** Find a lightly edited quote. Short quotes are matched whole; long ones by
+ *  their head and tail, which must pair up at a plausible length. Searches a
+ *  window around the old position to keep the cost bounded. */
+function fuzzyFind(text: string, anchor: QuoteAnchor): Span | null {
+  const quote = anchor.quote;
+  if (quote.trim().length < 4) return null; // too short to tell an edit from a coincidence
+  const from = Math.max(0, anchor.start - FUZZY_WINDOW);
+  const to = Math.min(text.length, anchor.end + FUZZY_WINDOW);
+  if (quote.length <= FUZZY_MAX_PATTERN) {
+    const hit = bestHit(text, approxSearch(text, quote, Math.floor(quote.length / 4), from, to), anchor);
+    return hit ? trimSpan(text, hit) : null;
+  }
+  const head = quote.slice(0, FUZZY_MAX_PATTERN / 2);
+  const tail = quote.slice(-FUZZY_MAX_PATTERN / 2);
+  const heads = approxSearch(text, head, Math.floor(head.length / 4), from, to);
+  const tails = approxSearch(text, tail, Math.floor(tail.length / 4), from, to);
+  let best: ApproxHit | null = null;
+  for (const h of heads) {
+    for (const t of tails) {
+      const length = t.end - h.start;
+      if (t.start < h.end || length < quote.length * 0.6 || length > quote.length * 1.4) continue;
+      // Cost = edits in head + tail + how far the span's length strays from
+      // the original, so repeated text cannot pair a head with the wrong tail.
+      // Small length drift is ordinary editing; only large drift is penalized.
+      const candidate = { start: h.start, end: t.end, errors: h.errors + t.errors + Math.floor(Math.abs(length - quote.length) / 8) };
+      if (!best || candidate.errors < best.errors
+        || (candidate.errors === best.errors && candidate.end - candidate.start > best.end - best.start)) best = candidate;
+    }
+  }
+  return best ? trimSpan(text, best) : null;
+}
+
+/** The quote was rewritten beyond recognition but the text around it was
+ *  not: anchor to whatever now sits between the old prefix and suffix. */
+function betweenContext(text: string, anchor: QuoteAnchor): Span | null {
+  const prefix = anchor.prefix?.slice(-16) ?? "";
+  const suffix = anchor.suffix?.slice(0, 16) ?? "";
+  // A quote at the very start or end of the document has (almost) no context
+  // on that side; the document boundary itself is the anchor there.
+  const atStart = prefix.trim() === "";
+  const atEnd = suffix.trim() === "";
+  if (atStart && atEnd) return null;
+  if ((!atStart && prefix.length < 8) || (!atEnd && suffix.length < 8)) return null;
+  const maxLength = anchor.quote.length * 3 + 50;
+  let best: Span | null = null;
+  const consider = (span: Span) => {
+    if (span.end <= span.start || span.end - span.start > maxLength) return;
+    if (!best || Math.abs(span.start - anchor.start) < Math.abs(best.start - anchor.start)) best = span;
+  };
+  if (atStart) {
+    const s = text.indexOf(suffix);
+    if (s >= 0) consider({ start: 0, end: s });
+  } else {
+    for (const p of quoteOccurrences(text, prefix)) {
+      const start = p + prefix.length;
+      if (atEnd) {
+        consider({ start, end: text.length });
+        continue;
+      }
+      const s = text.indexOf(suffix, start);
+      if (s >= 0) consider({ start, end: s });
+    }
+  }
+  return best ? trimSpan(text, best) : null;
+}
+
+function trimSpan(text: string, span: Span): Span | null {
+  let { start, end } = span;
+  while (start < end && /\s/.test(text[start])) start++;
+  while (end > start && /\s/.test(text[end - 1])) end--;
+  return end > start ? { start, end } : null;
 }

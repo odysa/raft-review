@@ -47,6 +47,8 @@ export interface ThreadRow {
   quote: string;
   prefix: string;
   suffix: string;
+  /** "" | "fuzzy" | "context": set when a new version edited the passage. */
+  reanchored: string;
   status: ThreadStatus;
   created_by: string;
   created_at: number;
@@ -140,6 +142,7 @@ CREATE TABLE IF NOT EXISTS threads (
   quote TEXT NOT NULL,
   prefix TEXT NOT NULL DEFAULT '',
   suffix TEXT NOT NULL DEFAULT '',
+  reanchored TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL,
@@ -169,6 +172,10 @@ CREATE TABLE IF NOT EXISTS suggestions (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS suggestions_thread ON suggestions(thread_id);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id TEXT PRIMARY KEY,
+  received_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS agent_events (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
@@ -200,6 +207,7 @@ const ADDITIVE_COLUMNS: Array<[string, string]> = [
   ["sessions", "verified_at INTEGER NOT NULL DEFAULT 0"],
   ["threads", "prefix TEXT NOT NULL DEFAULT ''"],
   ["threads", "suffix TEXT NOT NULL DEFAULT ''"],
+  ["threads", "reanchored TEXT NOT NULL DEFAULT ''"],
 ];
 
 function init(db: DatabaseSync): void {

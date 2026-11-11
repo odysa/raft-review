@@ -9,7 +9,7 @@ import {
   lineOf,
   mapSpanThroughEdit,
   pageOf,
-  reanchor,
+  reanchorDetailed,
   type Span,
 } from "./anchor.ts";
 import {
@@ -214,17 +214,25 @@ export function addVersion(db: Db, user: User, documentId: string, input: {
     );
     run(db, "UPDATE documents SET current_version = ?, updated_at = ? WHERE id = ?", version, t, doc.id);
     for (const thread of all<ThreadRow>(db, "SELECT * FROM threads WHERE document_id = ? AND status != 'resolved'", doc.id)) {
-      const span = reanchor(text, thread);
-      if (span) {
+      const found = reanchorDetailed(text, thread);
+      if (found) {
+        const { span, match } = found;
         const ctx = contextFor(text, span);
-        run(db, `UPDATE threads SET start = ?, "end" = ?, prefix = ?, suffix = ?, status = 'open', updated_at = ? WHERE id = ?`,
-          span.start, span.end, ctx.prefix, ctx.suffix, t, thread.id);
+        // A fuzzy or context match means the passage itself was edited: keep
+        // the thread on the new wording and say so in the UI.
+        run(db, `UPDATE threads SET start = ?, "end" = ?, quote = ?, prefix = ?, suffix = ?, status = 'open',
+            reanchored = ?, updated_at = ? WHERE id = ?`,
+          span.start, span.end, text.slice(span.start, span.end), ctx.prefix, ctx.suffix,
+          match === "exact" ? (thread.reanchored ?? "") : match, t, thread.id);
       } else {
         run(db, "UPDATE threads SET status = 'orphaned', updated_at = ? WHERE id = ?", t, thread.id);
       }
     }
     for (const s of pendingSuggestions(db, doc.id)) {
-      const span = reanchor(text, { start: s.start, end: s.end, quote: s.original });
+      // Suggestions only follow an exact match: applying one to edited text
+      // would overwrite wording the suggestion never saw.
+      const found = reanchorDetailed(text, { start: s.start, end: s.end, quote: s.original });
+      const span = found?.match === "exact" ? found.span : null;
       if (span) run(db, `UPDATE suggestions SET start = ?, "end" = ? WHERE id = ?`, span.start, span.end, s.id);
       else run(db, "UPDATE suggestions SET status = 'stale', decided_at = ? WHERE id = ?", t, s.id);
     }
@@ -468,6 +476,7 @@ export function threadView(db: Db, thread: ThreadRow, text: string, kind: DocKin
     id: thread.id,
     document_id: thread.document_id,
     status: thread.status,
+    reanchored: thread.reanchored || null,
     anchor: {
       start: thread.start,
       end: thread.end,

@@ -67,7 +67,9 @@ You become the document's reviewer. Share the `document_url` from the response
 
 Prefer `suggest_edit` for targeted changes so each one can be accepted or
 rejected. Use `upload_version` only for a full rewrite: open threads re-anchor
-by their quoted text, and threads whose text disappeared become orphaned.
+by their quoted text, then by approximate match, then by the unchanged text around
+them (marked *text edited*). Threads whose text disappeared become orphaned, and
+pending suggestions on changed text go stale.
 
 ## PDFs
 

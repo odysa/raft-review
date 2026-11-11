@@ -17,6 +17,7 @@ import { after, before, test } from "node:test";
 import type { Config } from "../src/config.ts";
 import { openDb } from "../src/db.ts";
 import { createApp } from "../src/server.ts";
+import { signWebhook } from "../src/webhooks.ts";
 
 const CLIENT_ID = "raft-review-test";
 const CLIENT_SECRET = "s3cret";
@@ -24,6 +25,8 @@ const SERVER_ID = "srv-1";
 const RESOURCE = `urn:raft:server:${SERVER_ID}:agent-inbound`;
 
 const events: any[] = [];
+const subscriptions: any[] = [];
+const WEBHOOK_SECRET = "raft_webhook_secret_test";
 // What `raft integration login --service ... --scope agent:event:write` grants.
 const AGENT_GRANT = ["agent:event:write"];
 let lastChallenge = "";
@@ -83,6 +86,16 @@ const mockRaft = http.createServer(async (req, res) => {
     events.push(body);
     return send(202, { id: `evt-${events.length}`, status: "queued" });
   }
+  if (url.pathname === "/api/oauth/installations/lookup") {
+    if (!basicOk) return send(401, { error: "Invalid client credentials" });
+    return body.server_id === SERVER_ID ? send(200, { installation_id: "inst-1", server_id: SERVER_ID }) : send(404, { error: "Active installation not found" });
+  }
+  if (url.pathname === "/api/oauth/installations/inst-1/subscriptions" && req.method === "PUT") {
+    if (!basicOk) return send(401, { error: "Invalid client credentials" });
+    const putBody = await readBody(req);
+    subscriptions.push(putBody);
+    return send(200, { installation_id: "inst-1", subscribed_events: putBody.events, subscription_revision: subscriptions.length });
+  }
   if (url.pathname === "/api/oauth/authorize") return send(200, {});
   send(404, { error: "not_found" });
 });
@@ -101,6 +114,7 @@ before(async () => {
     port: 0, publicUrl: base, raftApiUrl: raftUrl, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
     raftServerId: SERVER_ID, dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID,
     membershipTtlMs: 0, // re-verify with Raft on every request in tests
+    webhookSecrets: [WEBHOOK_SECRET, "raft_webhook_secret_previous"],
   };
   app = createApp(config, { db: openDb(":memory:") });
 });
@@ -230,7 +244,7 @@ test("without RAFT_SERVER_ID the app learns the server from the first human", as
   await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
   const base2 = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
   app2 = createApp({ port: 0, publicUrl: base2, raftApiUrl: raftUrl, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
-    raftServerId: "", dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID }, { db });
+    raftServerId: "", dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID, webhookSecrets: [] }, { db });
   try {
     const early = await fetch(`${base2}/auth/callback?code=login-req`, { redirect: "manual" });
     assert.equal(early.status, 409);
@@ -248,6 +262,66 @@ test("without RAFT_SERVER_ID the app learns the server from the first human", as
   } finally {
     srv.close();
   }
+});
+
+async function humanLogin(): Promise<string> {
+  const login = await fetch(`${base}/auth/login`, { redirect: "manual" });
+  const authorize = new URL(login.headers.get("location")!);
+  lastChallenge = authorize.searchParams.get("code_challenge")!;
+  const cb = await fetch(`${base}/auth/callback?code=human-code&state=${authorize.searchParams.get("state")}`,
+    { redirect: "manual", headers: { cookie: login.headers.getSetCookie()[0].split(";")[0] } });
+  return cb.headers.getSetCookie()[0].split(";")[0];
+}
+
+function deliver(body: object, opts: { secret?: string; timestamp?: number; delivery?: string } = {}) {
+  const raw = JSON.stringify(body);
+  const ts = String(opts.timestamp ?? Math.floor(Date.now() / 1000));
+  return fetch(`${base}/webhooks/raft`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-raft-delivery": opts.delivery ?? crypto.randomUUID(),
+      "x-raft-timestamp": ts,
+      "x-raft-signature": signWebhook(opts.secret ?? WEBHOOK_SECRET, ts, raw),
+    },
+    body: raw,
+  });
+}
+
+const memberEvent = (type: string, sub: string) => ({
+  installation_id: "inst-1", delivery_id: "d", attempt: 1,
+  event: { id: "e", type, server_id: SERVER_ID, occurred_at: new Date().toISOString(), subject: { type: "member", principal_type: "human", sub } },
+});
+
+test("app subscribes to member events on its installation at startup", async () => {
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(subscriptions.at(-1)?.events, ["server.member_removed", "server.member_role_changed"]);
+});
+
+test("signed member_removed webhook ends sessions immediately", async () => {
+  const cookie = await humanLogin();
+  assert.equal((await call(cookie, "GET", "/api/documents")).status, 200);
+
+  // Forged, stale and unsigned deliveries are refused.
+  assert.equal((await deliver(memberEvent("server.member_removed", "human-1"), { secret: "wrong" })).status, 401);
+  assert.equal((await deliver(memberEvent("server.member_removed", "human-1"), { timestamp: Math.floor(Date.now() / 1000) - 3600 })).status, 401);
+  assert.equal((await call(cookie, "GET", "/api/documents")).status, 200, "nothing happened yet");
+
+  // Role change forces a re-check but keeps the session.
+  const role = await deliver(memberEvent("server.member_role_changed", "human-1"));
+  assert.equal(role.status, 200);
+  assert.equal((await call(cookie, "GET", "/api/documents")).status, 200);
+
+  // The previous secret still verifies during rotation; retries are idempotent.
+  const res = await deliver(memberEvent("server.member_removed", "human-1"), { secret: "raft_webhook_secret_previous", delivery: "dup-1" });
+  assert.equal(res.status, 200);
+  assert.ok((await res.json()).sessions_ended >= 1);
+  const again = await deliver(memberEvent("server.member_removed", "human-1"), { delivery: "dup-1" });
+  assert.equal((await again.json()).duplicate, true);
+
+  // Userinfo would still say "member" here (the mock never revoked the token):
+  // access ended because Raft told us, not because a re-check caught it.
+  assert.equal((await call(cookie, "GET", "/api/documents")).status, 401);
 });
 
 test("unauthenticated and cross-origin requests are refused", async () => {

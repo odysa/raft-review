@@ -9,6 +9,7 @@ import { all, get, openDb, run, type Db, type User } from "./db.ts";
 import { buildManifest } from "./manifest.ts";
 import { createRaftNotifier, recentAgentEvents, type Notifier, type NotifyReason } from "./notify.ts";
 import { newPkce, RaftClient, RaftError, type RaftUserinfo } from "./raft.ts";
+import { handleWebhook, SUBSCRIBED_EVENTS, verifyWebhook, WebhookError } from "./webhooks.ts";
 import {
   addComment,
   addVersion,
@@ -134,10 +135,11 @@ export interface AppDeps {
 
 export function createApp(config: Config, deps: AppDeps = {}) {
   const db = deps.db ?? openDb(config.dataDir);
-  const raft = new RaftClient(config, deps.fetchImpl, () => {
+  function raftServerHint(): string | null {
     const servers = all<{ server_id: string }>(db, "SELECT DISTINCT server_id FROM users WHERE id NOT LIKE 'dev-%'");
     return servers.length === 1 ? servers[0].server_id : null;
-  });
+  }
+  const raft = new RaftClient(config, deps.fetchImpl, raftServerHint);
   const notifier = deps.notifier ?? createRaftNotifier(db, config, raft);
   const secureCookies = config.publicUrl.startsWith("https://");
   const membershipTtlMs = config.membershipTtlMs ?? 60_000;
@@ -247,6 +249,33 @@ export function createApp(config: Config, deps: AppDeps = {}) {
 
   const docUrl = (id: string) => `${config.publicUrl}/#/doc/${id}`;
 
+  // ---------- App Notifications ----------
+  let subscribed: Promise<void> | null = null;
+  function ensureSubscribed(): void {
+    if (subscribed || config.webhookSecrets.length === 0 || !config.clientSecret) return;
+    const serverId = config.raftServerId || raftServerHint();
+    if (!serverId) return; // retried after the first human sign-in
+    subscribed = raft.subscribe(serverId, SUBSCRIBED_EVENTS).then((r) => {
+      console.log(`[raft-review] App Notifications: ${r.detail}`);
+      if (!r.ok) subscribed = null;
+    }, (err) => {
+      console.error("[raft-review] App Notifications subscribe failed", (err as Error).message);
+      subscribed = null;
+    });
+  }
+  ensureSubscribed();
+
+  async function readRaw(req: Req): Promise<string> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > 1024 * 1024) throw new HttpError(413, "too_large", "webhook body is too large");
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
   // ---------- routes ----------
   const routes: Array<{ method: string; pattern: RegExp; keys: string[]; handler: Handler }> = [];
   function route(method: string, pathPattern: string, handler: Handler): void {
@@ -310,6 +339,7 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       const info = await raft.userinfo(token.access_token);
       if (info.type !== "human") throw new HttpError(400, "unexpected_principal", "browser sign-in must be a human");
       const user = userFromInfo(info);
+      ensureSubscribed();
       res.writeHead(302, {
         location: row.return_to,
         "set-cookie": [
@@ -534,6 +564,32 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       set.delete(ctx.res);
       if (set.size === 0) listeners.delete(id);
     });
+  });
+
+  // Signed Raft-to-App webhook (App Notifications). Authenticated by HMAC,
+  // not by session; Raft sends no Origin header.
+  route("POST", "/webhooks/raft", async ({ req, res }) => {
+    const body = await readRaw(req);
+    const header = (name: string) => {
+      const v = req.headers[name];
+      return Array.isArray(v) ? v[0] : v;
+    };
+    try {
+      verifyWebhook({ secrets: config.webhookSecrets, body, timestamp: header("x-raft-timestamp"), signature: header("x-raft-signature") });
+      let payload: unknown;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        throw new WebhookError(400, "bad_json", "body must be JSON");
+      }
+      json(res, 200, handleWebhook(db, header("x-raft-delivery"), payload));
+    } catch (err) {
+      if (err instanceof WebhookError) {
+        json(res, err.status, { error: err.code, message: err.message });
+        return;
+      }
+      throw err;
+    }
   });
 
   route("GET", "/docs/agents", ({ res }) => {

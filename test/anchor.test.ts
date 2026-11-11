@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { applyEdit, findQuote, mapSpanThroughEdit, pageOf, reanchor } from "../src/anchor.ts";
+import { applyEdit, approxSearch, contextFor, findQuote, mapSpanThroughEdit, pageOf, reanchor, reanchorDetailed } from "../src/anchor.ts";
 
 test("span before an edit is unchanged, span after shifts", () => {
   const edit = { start: 10, end: 15, insertLength: 2 }; // delta -3
@@ -65,4 +65,59 @@ test("pageOf counts form feeds", () => {
   assert.equal(pageOf(text, 0), 1);
   assert.equal(pageOf(text, 4), 2);
   assert.equal(pageOf(text, text.length - 1), 3);
+});
+
+function anchorFor(text: string, quote: string) {
+  const start = text.indexOf(quote);
+  const span = { start, end: start + quote.length };
+  return { ...span, quote, ...contextFor(text, span) };
+}
+
+test("approxSearch finds a match within the error budget", () => {
+  const hits = approxSearch("the quick brwn fox", "quick brown", 1);
+  assert.ok(hits.some((h) => h.errors === 1 && "the quick brwn fox".slice(h.start, h.end) === "quick brwn"));
+  assert.equal(approxSearch("nothing alike here", "quick brown", 2).length, 0);
+});
+
+test("lightly edited quote re-anchors fuzzily (Hypothesis-style)", () => {
+  const v1 = "Intro paragraph.\n\nOur method outperforms all prior work on every benchmark.\n\nConclusion.";
+  const anchor = anchorFor(v1, "outperforms all prior work on every benchmark");
+  const v2 = "A new opening line was added here.\n\nIntro paragraph.\n\nOur method outperforms most prior work on every benchmark.\n\nConclusion.";
+  const found = reanchorDetailed(v2, anchor)!;
+  assert.equal(found.match, "fuzzy");
+  assert.equal(v2.slice(found.span.start, found.span.end), "outperforms most prior work on every benchmark");
+});
+
+test("rewritten quote with unchanged surroundings anchors between the context", () => {
+  const v1 = "Section two begins here. The results were extremely good overall. Section three starts now.";
+  const anchor = anchorFor(v1, "The results were extremely good overall.");
+  const v2 = "Section two begins here. We observe a 4% gain on two of three tasks. Section three starts now.";
+  const found = reanchorDetailed(v2, anchor)!;
+  assert.equal(found.match, "context");
+  assert.equal(v2.slice(found.span.start, found.span.end), "We observe a 4% gain on two of three tasks.");
+});
+
+test("long quotes match by head and tail", () => {
+  const para = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(8).trim();
+  const v1 = `Start.\n${para}\nEnd.`;
+  const anchor = anchorFor(v1, para);
+  const edited = para.replace("consectetur", "consecteture").replace(/elit\.$/, "elit!");
+  const v2 = `Start, revised.\n${edited}\nEnd.`;
+  const found = reanchorDetailed(v2, anchor)!;
+  assert.equal(found.match, "fuzzy");
+  assert.equal(v2.slice(found.span.start, found.span.end), edited);
+});
+
+test("a rewritten last sentence follows the edit using the document end as context", () => {
+  const v1 = "Atlas is available today at no additional cost. In conclusion, Atlas is a game-changer.\n";
+  const anchor = anchorFor(v1, "In conclusion, Atlas is a game-changer.");
+  const v2 = "Atlas is available today at no additional cost. In short, it changes how teams review documents.\n";
+  const found = reanchorDetailed(v2, anchor)!;
+  assert.equal(found.match, "context");
+  assert.equal(v2.slice(found.span.start, found.span.end), "In short, it changes how teams review documents.");
+});
+
+test("unrelated text still orphans", () => {
+  const anchor = anchorFor("alpha beta gamma delta epsilon", "beta gamma delta");
+  assert.equal(reanchor("completely different words in here", anchor), null);
 });

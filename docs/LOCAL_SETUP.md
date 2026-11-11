@@ -29,6 +29,35 @@ npm test             # 50 tests, including real LaTeX compiles when Tectonic is 
 
 ---
 
+## Quickest: Docker (no Node or TeX needed)
+
+```bash
+docker build -t raft-review .
+docker run -d --name raft-review --restart unless-stopped -v raft-review-data:/data \
+  -e RAFT_REVIEW_DEV_LOGIN=1 -e PUBLIC_URL=http://localhost:8787 -p 127.0.0.1:8787:8787 raft-review
+node scripts/dev-agent.mjs publish examples/sparse-routing "Sparse Routing"   # seed the example paper
+```
+
+Open http://localhost:8787, click **As human**, and open the paper. Data persists
+in the `raft-review-data` volume. Stop with `docker stop raft-review`; reset with
+`docker rm -f raft-review && docker volume rm raft-review-data`.
+
+### Play the agent from the terminal
+
+In dev mode no real agent is woken. `scripts/dev-agent.mjs` does what a Raft agent
+does with `raft integration invoke`:
+
+```bash
+node scripts/dev-agent.mjs pending                      # threads waiting on the agent
+node scripts/dev-agent.mjs thread <thread_id>           # PDF quote, LaTeX location and context
+node scripts/dev-agent.mjs reply <thread_id> "Agreed."
+node scripts/dev-agent.mjs suggest <thread_id> "New LaTeX here." "Why"
+node scripts/dev-agent.mjs patch <document_id>          # accepted changes as a git patch
+node scripts/dev-agent.mjs publish <latex-folder> "Title"
+```
+
+`RAFT_REVIEW_URL` and `AGENT_NAME` override the defaults (`http://localhost:8787`, `Scribe`).
+
 ## A. Dev mode (no Raft)
 
 ```bash

@@ -55,7 +55,10 @@ npm install
 npm run dev     # http://localhost:8787, with a dev sign-in for "human" and "agent"
 ```
 
-Zip [`examples/sparse-routing`](examples/sparse-routing) and drop it on the page to try the paper workflow.
+Zip [`examples/sparse-routing`](examples/sparse-routing) and drop it on the page to try the paper workflow,
+or publish it as the agent with `node scripts/dev-agent.mjs publish examples/sparse-routing`. The same
+script lets you play the agent from the terminal (`pending`, `thread`, `reply`, `suggest`, `patch`). With
+Docker only, no Node or TeX needed, see the top of [LOCAL_SETUP](docs/LOCAL_SETUP.md).
 
 - **[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md):** dev mode, connecting to your raft.build server through a tunnel, troubleshooting.
 - **[docs/DEPLOY.md](docs/DEPLOY.md):** production with Docker, TLS, Raft registration, backups and upgrades.

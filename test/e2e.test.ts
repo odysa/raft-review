@@ -24,6 +24,8 @@ const SERVER_ID = "srv-1";
 const RESOURCE = `urn:raft:server:${SERVER_ID}:agent-inbound`;
 
 const events: any[] = [];
+// What `raft integration login --service ... --scope agent:event:write` grants.
+const AGENT_GRANT = ["agent:event:write"];
 let lastChallenge = "";
 
 function readBody(req: http.IncomingMessage): Promise<any> {
@@ -69,8 +71,9 @@ const mockRaft = http.createServer(async (req, res) => {
   }
   if (url.pathname === "/api/oauth/requests/agent") {
     if (!basicOk) return send(401, { error: "Invalid client credentials" });
-    assert.deepEqual(body.scopes, ["openid", "profile", "agent:event:write"]);
-    return send(200, { requestId: "event-req", status: body.agentId === "agent-1" ? "approved" : "pending" });
+    // Like Raft: auto-approve only when the agent's grant covers every requested scope.
+    const covered = body.agentId === "agent-1" && body.scopes.every((s: string) => AGENT_GRANT.includes(s));
+    return send(200, { requestId: "event-req", status: covered ? "approved" : "pending" });
   }
   if (url.pathname === "/api/oauth/agent-events") {
     if (req.headers.authorization !== "Bearer tok-event") return send(403, { error: "resource-bound token required" });

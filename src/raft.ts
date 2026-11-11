@@ -15,7 +15,10 @@ import { callbackUrl, type Config } from "./config.ts";
 import type { PrincipalType } from "./db.ts";
 
 export const HUMAN_SCOPES = "openid profile";
-export const AGENT_EVENT_SCOPES = ["openid", "profile", "agent:event:write"];
+// Least privilege, and it matters for coverage: Raft auto-approves only when an
+// existing grant's scopes cover every requested scope, so asking for more than
+// the event route needs could leave the request pending forever.
+export const AGENT_EVENT_SCOPES = ["agent:event:write"];
 
 export interface RaftUserinfo {
   sub: string;

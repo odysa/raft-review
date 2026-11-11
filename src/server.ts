@@ -513,6 +513,10 @@ export function createApp(config: Config, deps: AppDeps = {}) {
 
   async function handle(req: Req, res: Res): Promise<void> {
     const url = new URL(req.url ?? "/", config.publicUrl);
+    // No framing (clickjacking on Accept buttons) and no URL leakage via Referer.
+    res.setHeader("x-frame-options", "DENY");
+    res.setHeader("content-security-policy", "frame-ancestors 'none'");
+    res.setHeader("referrer-policy", "same-origin");
     try {
       // Reject cross-origin state changes outright (defense in depth on top
       // of SameSite=Lax and the JSON-only body rule).

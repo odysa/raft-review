@@ -39,6 +39,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!devLogin && (!config.clientId || !config.clientSecret)) {
     throw new Error("RAFT_CLIENT_ID and RAFT_CLIENT_SECRET are required (or set RAFT_REVIEW_DEV_LOGIN=1 for local development)");
   }
+  if (!devLogin && !config.raftServerId) {
+    throw new Error("RAFT_SERVER_ID is required: agent tokens with agent:event:write are bound to urn:raft:server:<id>:agent-inbound");
+  }
   if (devLogin && new URL(publicUrl).hostname !== "localhost" && new URL(publicUrl).hostname !== "127.0.0.1") {
     throw new Error("RAFT_REVIEW_DEV_LOGIN=1 is only allowed when PUBLIC_URL is localhost");
   }

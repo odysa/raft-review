@@ -12,7 +12,7 @@ import { zipSync } from "fflate";
 import { checkSourceSafety, createTectonicCompiler, findTectonic } from "../src/compile.ts";
 import type { Config } from "../src/config.ts";
 import { openDb } from "../src/db.ts";
-import { indexLatex, indexPlain, locate, projectLatex } from "../src/latex.ts";
+import { contextOf, indexLatex, indexPlain, locate, mathSpanAround, projectLatex, tidySourceSpan } from "../src/latex.ts";
 import { createApp } from "../src/server.ts";
 import { parseSyncTex, syncTexLookup } from "../src/synctex.ts";
 import { unzipProject, ZipError } from "../src/zip.ts";
@@ -44,7 +44,7 @@ describe("LaTeX ↔ PDF text mapping", () => {
   test("projection drops markup, math, cites and comments; keeps wrapped text", () => {
     const src = "A \\emph{bold} claim~\\cite{x} with $x^2$ math % comment\n\\textbf{and} ``quotes'' -- dash\\footnote{note}.";
     const p = projectLatex(src).text;
-    assert.equal(p.replace(/\s+/g, " ").trim(), "A bold claim with math and \"quotes\" - dash note.");
+    assert.equal(p.replace(/\s+/g, " ").trim(), "A bold claim with x2 math and \"quotes\" - dash note.");
   });
 
   test("a PDF quote with hyphenation and ligatures maps to exact source", () => {
@@ -58,6 +58,44 @@ describe("LaTeX ↔ PDF text mapping", () => {
   test("emphasized and cited text matches with markup removed", () => {
     const m = locate(indexLatex(MAIN), indexPlain("our method outperforms all prior work by a significant\nmargin").norm)!;
     assert.match(MAIN.slice(m.start, m.end), /^our method \\emph\{outperforms all prior work\} by a significant\nmargin$/);
+  });
+});
+
+describe("equations, tables and repeated phrases", () => {
+  test("typeset equation text maps to its LaTeX", () => {
+    // What PDF.js extracts for the equation in METHOD.
+    const pdf = "L = − ∑\nt\nlog p(xt | x<t). (1)";
+    const m = locate(indexLatex(METHOD), indexPlain(pdf).norm)!;
+    assert.ok(m, "found");
+        const t = tidySourceSpan(METHOD, m);
+    assert.match(METHOD.slice(t.start, t.end), /^\\mathcal\{L\} = -\\sum_t \\log p\(x_t \\mid x_\{<t\}\)\.?$/);
+  });
+
+  test("a table row maps to its source row", () => {
+    const tex = String.raw`\begin{tabular}{lrr}\toprule Model & PG-19 ppl & Speed \\ \midrule
+Dense & 18.2 & 1.0$\times$ \\
+Sparse Routing & 18.0 & 3.1$\times$ \\ \bottomrule\end{tabular}`;
+    const m = tidySourceSpan(tex, locate(indexLatex(tex), indexPlain("Sparse Routing 18.0 3.1×").norm)!);
+    assert.equal(tex.slice(m.start, m.end), "Sparse Routing & 18.0 & 3.1$\\times$");
+  });
+
+  test("a repeated phrase resolves by the text around it, without SyncTeX", () => {
+    const tex = "Our first experiment shows the model is robust to noise in the inputs.\n\n"
+      + "A second ablation removes the router; again the model is robust to noise, which surprised us.\n";
+    const pdf = "Our first experiment shows the model is robust to noise in the inputs.\nA second ablation removes the router; again the model\nis robust to noise, which surprised us.";
+    const quote = "the model\nis robust to noise";
+    const start = pdf.indexOf(quote);
+    const idx = indexPlain(pdf);
+    const ctx = contextOf(idx, { start, end: start + quote.length });
+    const m = locate(indexLatex(tex), indexPlain(quote).norm, undefined, ctx)!;
+    assert.ok(m.start > tex.indexOf("second"), `picked the second occurrence (got offset ${m.start})`);
+    const without = locate(indexLatex(tex), indexPlain(quote).norm)!;
+    assert.ok(without.start < tex.indexOf("second"), "without context the first occurrence would win");
+  });
+
+  test("mathSpanAround returns the whole equation for a line inside it", () => {
+    const span = mathSpanAround(METHOD, 5)!;
+    assert.match(METHOD.slice(span.start, span.end), /^\\begin\{equation\}[\s\S]*\\end\{equation\}$/);
   });
 });
 
@@ -241,6 +279,30 @@ describe("paper review loop over HTTP", { skip: tectonic ? false : "tectonic not
     assert.match(new TextDecoder().decode(files.find((f) => f.path === "sections/method.tex")!.data), /validation split/);
   });
 
+  test("comments on an equation and a table row map to their LaTeX", async () => {
+    const human = client(env.base, await login(env.base, "human", "Ada"));
+    const tableTex = String.raw`\begin{table}[h]\centering\begin{tabular}{lr}\toprule Model & ppl \\ \midrule Dense & 18.2 \\ Sparse Routing & 18.0 \\ \bottomrule\end{tabular}\caption{Results.}\end{table}`;
+    const main = MAIN.replace("\\usepackage{amsmath}", "\\usepackage{amsmath,booktabs}")
+      .replace("\\input{sections/method}", `\\input{sections/method}\n${tableTex}`);
+    const created = await human("POST", "/api/papers", { title: "Eq", files: [{ path: "main.tex", content: main }, { path: "sections/method.tex", content: METHOD }] });
+    const id = created.body.id;
+    const doc = await waitFor(async () => {
+      const d = (await human("GET", `/api/documents/${id}`)).body;
+      if (d.paper.compile.status === "failed") assert.fail((await human("GET", `/api/documents/${id}/compile-log`)).body.log.slice(-1500));
+      return d.paper.compile.status === "ok" ? d : null;
+    });
+    // Equation: select what PDF.js extracted for it.
+    const eq = /L = − ∑[\s\S]*?x<t\)\./.exec(doc.text)!;
+    const mapEq = await human("POST", `/api/documents/${id}/map`, { start: eq.index, end: eq.index + eq[0].length });
+    assert.equal(mapEq.body.source.path, "sections/method.tex");
+    assert.match(mapEq.body.source.quote, /\\sum_t \\log p\(x_t/);
+    // Table row.
+    const row = /Sparse Routing 18\.0/.exec(doc.text)!;
+    const mapRow = await human("POST", `/api/documents/${id}/map`, { start: row.index, end: row.index + row[0].length });
+    assert.equal(mapRow.body.source.path, "main.tex");
+    assert.equal(mapRow.body.source.quote, "Sparse Routing & 18.0");
+  });
+
   test("an agent can anchor a comment by quoting the LaTeX", async () => {
     const agent = client(env.base, await login(env.base, "agent", "Scribe"));
     const created = await agent("POST", "/api/papers", { title: "P2", files: [{ path: "main.tex", content: MAIN }, { path: "sections/method.tex", content: METHOD }] });
@@ -266,6 +328,20 @@ describe("paper without a server compiler", { skip: tectonic ? false : "tectonic
         assert.ok(r.ok, r.log);
         return { pdf_base64: Buffer.from(r.pdf!).toString("base64"), synctex_base64: Buffer.from(r.synctex!).toString("base64") };
       };
+      // Repeated phrase, PDF uploaded without SyncTeX: context picks the right one.
+      const repeated = String.raw`\documentclass{article}\begin{document}
+Our first experiment shows the model is robust to noise in the inputs.
+
+A second ablation removes the router; again the model is robust to noise, which surprised us.
+\end{document}
+`;
+      const { pdf_base64 } = await build({ "main.tex": repeated });
+      const rep = await agent("POST", "/api/papers", { title: "Rep", files: [{ path: "main.tex", content: repeated }], pdf_base64 });
+      const repDoc = (await human("GET", `/api/documents/${rep.body.id}`)).body;
+      const at = repDoc.text.indexOf("the model is robust to noise", repDoc.text.indexOf("second"));
+      const mapped = await human("POST", `/api/documents/${rep.body.id}/map`, { start: at, end: at + "the model is robust to noise".length });
+      assert.equal(mapped.body.source.line, 4, "second occurrence (line 4), not the first (line 2)");
+
       const created = await agent("POST", "/api/papers", { title: "P3", files: [{ path: "main.tex", content: MAIN }, { path: "sections/method.tex", content: METHOD }], ...(await build({ "main.tex": MAIN, "sections/method.tex": METHOD })) });
       const id = created.body.id;
       const d1 = (await human("GET", `/api/documents/${id}`)).body;

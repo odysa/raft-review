@@ -8,6 +8,7 @@ import { loadConfig, type Config } from "./config.ts";
 import { all, get, openDb, run, type Db, type User } from "./db.ts";
 import { log } from "./log.ts";
 import { createLimiter } from "./ratelimit.ts";
+import { createCompileQueue, type CompileQueue } from "./jobs.ts";
 import { SCHEMA_VERSION } from "./db.ts";
 import { buildManifest } from "./manifest.ts";
 import { createTectonicCompiler, findTectonic, safeProjectPath, type Compiler, type ProjectFile } from "./compile.ts";
@@ -180,6 +181,7 @@ export function createApp(config: Config, deps: AppDeps = {}) {
   }
   const raft = new RaftClient(config, deps.fetchImpl, raftServerHint);
   const notifier = deps.notifier ?? createRaftNotifier(db, config, raft);
+  let compileQueue: CompileQueue | null = null;
   const compiler: Compiler | null = deps.compiler !== undefined ? deps.compiler : (() => {
     if (config.compiler === "none") return null;
     const binary = findTectonic(config.tectonicPath);
@@ -194,16 +196,42 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       onlyCached: config.tectonicOnlyCached,
     });
   })();
-  const pendingCompiles = new Set<Promise<unknown>>();
+  const instance = randomBytes(8).toString("hex");
   const secureCookies = config.publicUrl.startsWith("https://");
   const membershipTtlMs = config.membershipTtlMs ?? 60_000;
   const pendingNotifications = new Set<Promise<unknown>>();
 
   // ---------- live updates (SSE) ----------
+  // Changes go to this process's viewers at once and, through the `changes`
+  // table, to viewers connected to any other process sharing the database.
   const listeners = new Map<string, Set<Res>>();
-  function broadcast(documentId: string, event: string): void {
+  function deliver(documentId: string, event: string): void {
     for (const res of listeners.get(documentId) ?? []) res.write(`event: change\ndata: ${JSON.stringify({ event })}\n\n`);
   }
+  function broadcast(documentId: string, event: string): void {
+    deliver(documentId, event);
+    run(db, "INSERT INTO changes (document_id, event, origin, created_at) VALUES (?, ?, ?, ?)", documentId, event, instance, Date.now());
+  }
+  let lastChange = get<{ id: number | null }>(db, "SELECT MAX(id) AS id FROM changes")?.id ?? 0;
+  let lastPrune = 0;
+  const changePoll = setInterval(() => {
+    try {
+      const rows = all<{ id: number; document_id: string; event: string; origin: string }>(
+        db, "SELECT id, document_id, event, origin FROM changes WHERE id > ? ORDER BY id LIMIT 1000", lastChange,
+      );
+      for (const r of rows) {
+        lastChange = r.id;
+        if (r.origin !== instance) deliver(r.document_id, r.event);
+      }
+      if (Date.now() - lastPrune > 60_000) {
+        lastPrune = Date.now();
+        run(db, "DELETE FROM changes WHERE created_at < ?", Date.now() - 10 * 60_000);
+      }
+    } catch (err) {
+      log("warn", "change_poll_failed", { error: (err as Error).message });
+    }
+  }, config.changePollMs ?? 250);
+  changePoll.unref();
 
   // ---------- sessions ----------
   function sessionCookie(value: string, maxAge: number): string {
@@ -299,6 +327,23 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     }).then(() => broadcast(input.documentId, "agent_notified")).catch(() => {});
     pendingNotifications.add(p);
     p.finally(() => pendingNotifications.delete(p));
+  }
+
+  if (compiler) {
+    compileQueue = createCompileQueue({
+      db,
+      compiler,
+      concurrency: config.compileConcurrency,
+      leaseMs: config.compileLeaseMs,
+      pollMs: config.compilePollMs,
+      onDone: ({ documentId, version, ok, requestedBy }) => {
+        broadcast(documentId, "compile");
+        const doc = get<{ reviewer_agent_id: string | null }>(db, "SELECT reviewer_agent_id FROM documents WHERE id = ?", documentId);
+        if (!ok && requestedBy && doc?.reviewer_agent_id) {
+          notifyAgent({ threadId: null, documentId, actor: requestedBy, reason: "compile_failed", agentId: doc.reviewer_agent_id, dedupeKey: `compile:${documentId}:${version}` });
+        }
+      },
+    });
   }
 
   const docUrl = (id: string) => `${config.publicUrl}/#/doc/${id}`;
@@ -615,40 +660,19 @@ export function createApp(config: Config, deps: AppDeps = {}) {
 
   // ---------- papers (LaTeX projects) ----------
 
-  /** Compile a version (or ask the agent for a PDF when there's no compiler). */
+  /** Queue a compile (or ask the agent for a PDF when there's no compiler). */
   function schedulePdf(documentId: string, version: number, actor: User | null): void {
-    const doc = get<{ reviewer_agent_id: string | null }>(db, "SELECT reviewer_agent_id FROM documents WHERE id = ?", documentId);
-    if (!compiler) {
+    if (!compileQueue) {
       setCompileStatus(db, documentId, version, "needs_pdf");
       broadcast(documentId, "compile");
+      const doc = get<{ reviewer_agent_id: string | null }>(db, "SELECT reviewer_agent_id FROM documents WHERE id = ?", documentId);
       if (actor && doc?.reviewer_agent_id) {
         notifyAgent({ threadId: null, documentId, actor, reason: "pdf_needed", agentId: doc.reviewer_agent_id, dedupeKey: `pdf:${documentId}:${version}` });
       }
       return;
     }
-    setCompileStatus(db, documentId, version, "compiling");
+    compileQueue.enqueue(documentId, version, actor?.id ?? null);
     broadcast(documentId, "compile");
-    const job = (async () => {
-      const main = get<{ main_path: string }>(db, "SELECT main_path FROM documents WHERE id = ?", documentId)?.main_path;
-      if (!main) return;
-      const result = await compiler.compile(loadProject(db, documentId, version), main);
-      log("info", "compile", { document: documentId, version, ok: result.ok, ms: result.ms });
-      if (result.ok && result.pdf) {
-        await ingestPdf(db, documentId, version, result.pdf, result.synctex ?? null, result.log);
-      } else {
-        setCompileStatus(db, documentId, version, "failed", result.log);
-        if (actor && doc?.reviewer_agent_id) {
-          notifyAgent({ threadId: null, documentId, actor, reason: "compile_failed", agentId: doc.reviewer_agent_id, dedupeKey: `compile:${documentId}:${version}` });
-        }
-      }
-      broadcast(documentId, "compile");
-    })().catch((err) => {
-      log("error", "compile_crashed", { document: documentId, version, error: (err as Error).message });
-      setCompileStatus(db, documentId, version, "failed", `Internal error while compiling: ${(err as Error).message}`);
-      broadcast(documentId, "compile");
-    });
-    pendingCompiles.add(job);
-    job.finally(() => pendingCompiles.delete(job));
   }
 
   /** Project files from a request: a zip (base64) or explicit files. */
@@ -821,7 +845,7 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       throw new HttpError(400, "invalid_anchor", "start/end must select text in the current PDF");
     }
     const src = mapPdfToSource(db, doc, version, {
-      quote: version.text.slice(start, end), page: pageOf(version.text, start),
+      quote: version.text.slice(start, end), span: { start, end }, page: pageOf(version.text, start),
       x: typeof body.x === "number" ? body.x : undefined, y: typeof body.y === "number" ? body.y : undefined,
     });
     if (!src) return json(ctx.res, 200, { source: null });
@@ -896,9 +920,9 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     fs.createReadStream(resolved).pipe(res);
   }
 
-  const authLimiter = createLimiter({ capacity: 20, perMinute: 20 });
-  const writeLimiter = createLimiter({ capacity: 120, perMinute: 120 });
-  const heavyLimiter = createLimiter({ capacity: 10, perMinute: 6 });
+  const authLimiter = createLimiter(db, { name: "auth", capacity: 20, perMinute: 20 });
+  const writeLimiter = createLimiter(db, { name: "write", capacity: 120, perMinute: 120 });
+  const heavyLimiter = createLimiter(db, { name: "heavy", capacity: 10, perMinute: 6 });
   function clientKey(req: Req): string {
     const fwd = config.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
     return fwd || req.socket.remoteAddress || "unknown";
@@ -906,9 +930,9 @@ export function createApp(config: Config, deps: AppDeps = {}) {
   function limit(req: Req, pathname: string): void {
     if (req.method === "GET" || req.method === "HEAD" || pathname === "/webhooks/raft") return;
     const key = clientKey(req);
-    const check = (limiter: ReturnType<typeof createLimiter>, bucket: string) => {
-      if (!limiter.take(`${bucket}:${key}`)) {
-        throw new HttpError(429, "rate_limited", `too many requests; retry in ${limiter.retryAfterSeconds(`${bucket}:${key}`)} s`);
+    const check = (limiter: ReturnType<typeof createLimiter>, _bucket: string) => {
+      if (!limiter.take(key)) {
+        throw new HttpError(429, "rate_limited", `too many requests; retry in ${limiter.retryAfterSeconds(key)} s`);
       }
     };
     if (pathname.startsWith("/auth/")) check(authLimiter, "auth");
@@ -983,17 +1007,18 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     compilerName: compiler?.name ?? "none",
     /** Graceful shutdown: end live streams, let running compiles finish. */
     async close(timeoutMs = 30_000): Promise<void> {
+      clearInterval(changePoll);
       for (const set of listeners.values()) for (const r of set) r.end();
       listeners.clear();
       await Promise.race([
-        Promise.all([...pendingCompiles, ...pendingNotifications]),
+        Promise.all([compileQueue?.stop(), ...pendingNotifications]),
         new Promise((r) => setTimeout(r, timeoutMs)),
       ]);
       db.close();
     },
     /** Test hook: wait for fire-and-forget agent notifications. */
     async settle(): Promise<void> {
-      await Promise.all([...pendingCompiles]);
+      await compileQueue?.idle();
       await Promise.all([...pendingNotifications]);
     },
   };

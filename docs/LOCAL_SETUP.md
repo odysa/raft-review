@@ -24,7 +24,7 @@ Three ways to run Raft Review on your machine, from quickest to most complete:
 git clone https://github.com/odysa/raft-review.git
 cd raft-review
 npm install          # dev tooling only: typescript + @types/node
-npm test             # 40 tests, including real LaTeX compiles when Tectonic is installed
+npm test             # 50 tests, including real LaTeX compiles when Tectonic is installed
 ```
 
 ---

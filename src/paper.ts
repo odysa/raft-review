@@ -22,7 +22,7 @@ import {
 import type { ProjectFile } from "./compile.ts";
 import { all, get, run, tx, type Db, type DocumentRow, type SuggestionRow, type ThreadRow, type User, type VersionRow } from "./db.ts";
 import { projectPatch } from "./diff.ts";
-import { indexLatex, indexPlain, locate, normalizedSlice, offsetOfLine, tidySourceSpan, type TextIndex } from "./latex.ts";
+import { contextOf, indexLatex, indexPlain, locate, mathSpanAround, normalizedSlice, offsetOfLine, tidySourceSpan, type MatchContext, type TextIndex } from "./latex.ts";
 import { extractPdfText } from "./pdftext.ts";
 import {
   clip,
@@ -144,7 +144,7 @@ function resolveSyncPath(input: string, projectPaths: string[]): string | null {
 export interface SourceAnchor extends Span {
   path: string;
   quote: string;
-  method: "synctex" | "text" | "source";
+  method: "synctex" | "text" | "source" | "synctex-math";
 }
 
 /** Map a PDF selection to the LaTeX that produced it. */
@@ -152,12 +152,14 @@ export function mapPdfToSource(
   db: Db,
   doc: DocumentRow,
   version: VersionRow,
-  input: { quote: string; page?: number; x?: number; y?: number },
+  input: { quote: string; page?: number; x?: number; y?: number; span?: Span },
 ): SourceAnchor | null {
   const files = textFiles(db, doc.id, version.version);
   const tex = [...files.entries()].filter(([p]) => /\.tex$/i.test(p));
   const needle = indexPlain(input.quote).norm;
   if (needle.length < 3) return null;
+  // The PDF text around the selection tells repeated phrases apart.
+  const context: MatchContext | undefined = input.span ? contextOf(indexPlain(version.text), input.span) : undefined;
 
   let hint: { path: string; line: number } | null = null;
   const sync = syncFor(version);
@@ -167,10 +169,11 @@ export function mapPdfToSource(
     if (hit && path) hint = { path, line: hit.line };
   }
 
-  let best: { path: string; span: Span; errors: number } | null = null;
+  let best: { path: string; span: Span; errors: number; score: number } | null = null;
   const consider = (path: string, content: string, near?: number) => {
-    const m = locate(latexIndex(content), needle, near);
-    if (m && (!best || m.errors < best.errors)) best = { path, span: m, errors: m.errors };
+    const m = locate(latexIndex(content), needle, near, context);
+    const score = m ? m.errors - m.context * 2 : Infinity;
+    if (m && (!best || score < best.score)) best = { path, span: m, errors: m.errors, score };
   };
   if (hint) {
     const content = files.get(hint.path);
@@ -187,6 +190,13 @@ export function mapPdfToSource(
     if (path === hint?.path) continue;
     consider(path, content);
   }
+  if (!best && hint) {
+    // Typeset math rarely matches its LaTeX character for character; when
+    // SyncTeX points into an equation, anchor to the whole equation.
+    const content = files.get(hint.path);
+    const span = content === undefined ? null : mathSpanAround(content, hint.line);
+    if (span) return { path: hint.path, ...span, quote: content!.slice(span.start, span.end), method: "synctex-math" };
+  }
   if (!best) return null;
   const b = best as { path: string; span: Span };
   return finish(b.path, files.get(b.path)!, b.span, hint?.path === b.path ? "synctex" : "text");
@@ -199,9 +209,10 @@ export function mapPdfToSource(
 
 /** Where a LaTeX span shows up in the PDF text. */
 export function mapSourceToPdf(pdfText: string, content: string, span: Span, nearPdf?: number): Span | null {
-  const needle = normalizedSlice(latexIndex(content), span);
+  const index = latexIndex(content);
+  const needle = normalizedSlice(index, span);
   if (needle.length < 3) return null;
-  const m = locate(indexPlain(pdfText), needle, nearPdf);
+  const m = locate(indexPlain(pdfText), needle, nearPdf, contextOf(index, span));
   return m ? { start: m.start, end: m.end } : null;
 }
 
@@ -380,6 +391,7 @@ export function createPaperThread(db: Db, user: User, doc: DocumentRow, input: {
     pdf = span;
     src = mapPdfToSource(db, doc, version, {
       quote: pdfText.slice(span.start, span.end),
+      span,
       page: pageOf(pdfText, span.start),
       x: typeof input.x === "number" ? input.x : undefined,
       y: typeof input.y === "number" ? input.y : undefined,
@@ -393,7 +405,7 @@ export function createPaperThread(db: Db, user: User, doc: DocumentRow, input: {
       const m = locate(indexPlain(pdfText), indexPlain(input.quote).norm);
       if (!m) throw new ReviewError(404, "quote_not_found", "quote not found in the LaTeX sources or the PDF text");
       pdf = { start: m.start, end: m.end };
-      src = mapPdfToSource(db, doc, version, { quote: pdfText.slice(m.start, m.end), page: pageOf(pdfText, m.start) });
+      src = mapPdfToSource(db, doc, version, { quote: pdfText.slice(m.start, m.end), span: pdf, page: pageOf(pdfText, m.start) });
     }
   } else {
     throw new ReviewError(400, "invalid_anchor", "give start/end in the PDF text or an exact quote");

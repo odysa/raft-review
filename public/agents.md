@@ -127,7 +127,10 @@ raft integration invoke --service raft-review --action upload_pdf --param docume
   --param pdf_base64=@main.pdf.b64 --param synctex_base64=@main.synctex.b64
 ```
 
-Sending SyncTeX makes PDF→LaTeX mapping exact even for repeated phrases.
+Sending SyncTeX makes PDF→LaTeX mapping more precise; without it, comments
+still map by matching the selected text and the text around it. Comments on
+equations and table cells map to their LaTeX too (a comment on an equation may
+cover the whole `equation` environment).
 
 ## Plain PDFs
 

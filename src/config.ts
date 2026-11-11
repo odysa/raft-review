@@ -29,6 +29,12 @@ export interface Config {
   tectonicOnlyCached: boolean;
   /** Behind a reverse proxy: take the client IP from X-Forwarded-For. */
   trustProxy?: boolean;
+  /** A compile whose worker stopped heartbeating this long ago is reclaimed. */
+  compileLeaseMs?: number;
+  /** How often each process checks the shared change feed for live updates. */
+  changePollMs?: number;
+  /** How often each process looks for queued compiles (it also looks at once when it queues one). */
+  compilePollMs?: number;
 }
 
 function trimSlash(value: string): string {
@@ -56,6 +62,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     compileConcurrency: Number(env.COMPILE_CONCURRENCY ?? 2),
     tectonicOnlyCached: env.TECTONIC_ONLY_CACHED === "1",
     trustProxy: env.TRUST_PROXY === "1",
+    compileLeaseMs: env.COMPILE_LEASE_MS ? Number(env.COMPILE_LEASE_MS) : undefined,
   };
   if (!devLogin && (!config.clientId || !config.clientSecret)) {
     throw new Error("RAFT_CLIENT_ID and RAFT_CLIENT_SECRET are required (or set RAFT_REVIEW_DEV_LOGIN=1 for local development)");

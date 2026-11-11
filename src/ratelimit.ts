@@ -1,5 +1,7 @@
-// In-memory token buckets keyed by client (IP or session). Enough for one
-// instance; put a shared limiter in front if you run several.
+// Token buckets stored in SQLite, so every process sharing the database
+// enforces the same limits.
+
+import { get, run, tx, type Db } from "./db.ts";
 
 export interface Limiter {
   /** true when allowed; false when the caller should get 429. */
@@ -7,31 +9,37 @@ export interface Limiter {
   retryAfterSeconds(key: string): number;
 }
 
-export function createLimiter(opts: { capacity: number; perMinute: number }): Limiter {
-  const buckets = new Map<string, { tokens: number; at: number }>();
+export function createLimiter(db: Db, opts: { name: string; capacity: number; perMinute: number }): Limiter {
   const refillPerMs = opts.perMinute / 60_000;
-  const refill = (key: string) => {
-    const now = Date.now();
-    const b = buckets.get(key) ?? { tokens: opts.capacity, at: now };
-    b.tokens = Math.min(opts.capacity, b.tokens + (now - b.at) * refillPerMs);
-    b.at = now;
-    buckets.set(key, b);
-    if (buckets.size > 50_000) {
-      // Drop idle full buckets.
-      for (const [k, v] of buckets) if (v.tokens >= opts.capacity) buckets.delete(k);
-    }
-    return b;
+  let lastPrune = 0;
+  const level = (key: string, now: number) => {
+    const row = get<{ tokens: number; at: number }>(db, "SELECT tokens, at FROM rate_limits WHERE key = ?", key);
+    return row ? Math.min(opts.capacity, row.tokens + (now - row.at) * refillPerMs) : opts.capacity;
   };
   return {
-    take(key, cost = 1) {
-      const b = refill(key);
-      if (b.tokens < cost) return false;
-      b.tokens -= cost;
-      return true;
+    take(raw, cost = 1) {
+      const key = `${opts.name}:${raw}`;
+      const now = Date.now();
+      const allowed = tx(db, () => {
+        const tokens = level(key, now);
+        const ok = tokens >= cost;
+        run(
+          db,
+          "INSERT INTO rate_limits (key, tokens, at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET tokens = excluded.tokens, at = excluded.at",
+          key, ok ? tokens - cost : tokens, now,
+        );
+        return ok;
+      });
+      if (now - lastPrune > 60_000) {
+        lastPrune = now;
+        // Buckets idle long enough to be full again carry no information.
+        run(db, "DELETE FROM rate_limits WHERE at < ?", now - 60 * 60_000);
+      }
+      return allowed;
     },
-    retryAfterSeconds(key) {
-      const b = refill(key);
-      return Math.max(1, Math.ceil((1 - b.tokens) / refillPerMs / 1000));
+    retryAfterSeconds(raw) {
+      const tokens = level(`${opts.name}:${raw}`, Date.now());
+      return Math.max(1, Math.ceil((1 - tokens) / refillPerMs / 1000));
     },
   };
 }

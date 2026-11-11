@@ -3,7 +3,7 @@
 **Review your research paper as a PDF, and let your [Raft](https://github.com/botiverse/raft-source) agent fix the LaTeX.**
 
 Comment on the compiled PDF the way you would in Google Docs. Raft Review finds the exact LaTeX behind
-the text you selected and wakes your agent in Raft. The agent replies and suggests a LaTeX edit. When you
+the text you selected (prose, equations or table cells) and wakes your agent in Raft. The agent replies and suggests a LaTeX edit. When you
 click **Accept**, the source is updated, the PDF is recompiled, and your comment stays on the new
 sentence. The agent then pulls the accepted changes as a `git` patch and commits them to the paper's repository.
 
@@ -20,11 +20,12 @@ Also works for Markdown, plain text and stand-alone PDFs. Built as a connected *
 
 | | |
 | --- | --- |
-| **1. Comment on the PDF.** Select text in the rendered paper. Before you write anything, the comment box shows where it lives in the LaTeX: `main.tex:14`. SyncTeX finds the file and line, and text matching pins the exact characters, ignoring hyphenation, ligatures, `\emph{}`, citations and `~`. | ![Commenting on the PDF; the comment box shows main.tex:14](docs/screenshots/paper-1-comment.png) |
+| **1. Comment on the PDF.** Select text in the rendered paper. Before you write anything, the comment box shows where it lives in the LaTeX: `main.tex:14`. SyncTeX finds the file and line, and text matching pins the exact characters, ignoring hyphenation, ligatures, `\emph{}`, citations and `~`. Equations map too (`L = − ∑ t log p(xt…` → `\mathcal{L} = -\sum_t \log p(x_t…`), and so do table cells. A phrase that appears twice resolves by the text around your selection. | ![Commenting on the PDF; the comment box shows main.tex:14](docs/screenshots/paper-1-comment.png) |
 | **2. Your agent answers in LaTeX.** It's woken in Raft with the command to run. `get_thread` gives it the LaTeX around your comment; it replies and suggests an edit to that source span. | ![Agent reply and LaTeX diff](docs/screenshots/paper-2-suggestion.png) |
 | **3. Accept → the PDF recompiles.** The source is updated and Tectonic rebuilds the paper in about a second. Your comment moves to the new sentence in the new PDF. | ![The recompiled PDF highlighting the accepted rewrite](docs/screenshots/paper-3-recompiled.png) |
 | **4. Changes go back to the repo.** **Changes** shows the source diff between any two versions; `get_patch` hands the agent the same diff to `git apply` and commit. | ![Source diff between versions](docs/screenshots/paper-4-patch.png) |
 | **5. Jump to the source.** Each comment links to its file and line. | ![The LaTeX file at the commented line](docs/screenshots/paper-5-source.png) |
+| **Equations and tables too.** Select a typeset equation and it maps to its LaTeX: `ri = top- k( softmax(qiWr))` → `r_i = \operatorname{top-}k\big(\operatorname{softmax}(q_i W_r)\big)` at `sections/method.tex:6`. | ![A comment on an equation, mapped to its LaTeX](docs/screenshots/paper-6-equation.png) |
 
 **Getting a paper in:**
 - **Upload the project `.zip`.** Overleaf: *Menu → Download → Source*. From git: `zip -r paper.zip . -x '.git/*'`.
@@ -60,7 +61,7 @@ Zip [`examples/sparse-routing`](examples/sparse-routing) and drop it on the page
 - **[docs/DEPLOY.md](docs/DEPLOY.md):** production with Docker, TLS, Raft registration, backups and upgrades.
 
 ```bash
-npm test            # 40 tests, including compiling real LaTeX and a git-apply round trip
+npm test            # 50 tests: real LaTeX compiles, a git-apply round trip, multi-process queue and crash recovery
 npm run typecheck
 ```
 
@@ -94,7 +95,8 @@ Agent guide: [public/agents.md](public/agents.md), also served at `/docs/agents`
 | **Auth** | Login with Raft per the contract: PKCE and browser-bound `state`; identity re-checked every ≤ 60 s; sessions never outlive the 1-hour token; webhook revocation. |
 | **Web security** | Strict CSP (scripts only from this origin; PDF.js is served locally), no eval, no framing, HSTS on HTTPS, JSON-only writes, `Origin` check, rate limits (sign-in, writes, uploads/compiles). |
 | **Uploads** | Zip-slip and zip-bomb protection; 50 MB / 2,000-file project limit; content-addressed storage, so each version stores only the files that changed. |
-| **Data** | SQLite in WAL mode with versioned migrations (`PRAGMA user_version`); `npm run backup` takes an online backup. |
+| **Data** | SQLite in WAL mode with versioned migrations (`PRAGMA user_version`, applied under a write lock so concurrent starts are safe); `npm run backup` takes an online backup. |
+| **Scale and recovery** | Several processes can share one database. A durable compile queue claims each job exactly once and heartbeats while it runs; a crashed worker's job is reclaimed. Live updates and rate limits are shared through the database. |
 | **Operations** | JSON logs (one line per request, compile timings); `/healthz` checks the database; graceful shutdown that finishes running compiles. |
 | **CI** | GitHub Actions: typecheck, the full test suite with Tectonic, then a Docker build and smoke test. |
 
@@ -124,6 +126,7 @@ Checked against Raft's [Build a Raft App](https://docs.raft.build/developers/raf
 src/latex.ts     LaTeX → reader text projection, normalization, fuzzy PDF↔source matching
 src/synctex.ts   SyncTeX reader: PDF point → source file and line
 src/compile.ts   sandboxed Tectonic compiles, source safety checks
+src/jobs.ts      durable compile queue: atomic claims, heartbeats, crash recovery
 src/paper.ts     paper projects: files, versions, mapping, accept → recompile → re-anchor
 src/diff.ts      Myers line diff → git-applicable unified patches
 src/anchor.ts    anchors through edits; exact, fuzzy and context re-anchoring
@@ -138,9 +141,7 @@ public/          web client (vanilla JS, PDF.js served by the app)
 
 - **Not yet run against a production Raft server.** The tests use a mock that enforces the contracts
   read from `raft-source`, and the manifest passes Raft's own validator.
-- **No SyncTeX without the server compiler:** when the agent uploads a PDF without `.synctex.gz`,
-  PDF→LaTeX mapping uses text matching only, which is less precise for phrases that repeat.
-- **Text inside math, tables and figures** can be commented on in the PDF but may not map to source
-  (equations render differently from their LaTeX). Such comments still work and the agent can target the
-  source with `path` and `quote`.
-- **Single instance:** rate limits and live updates are in-memory, so run one instance per database.
+- **One host per database.** Processes share state through SQLite, so they must share the data
+  volume. Spreading across machines would mean swapping SQLite for a networked database.
+- **Leases after a crash.** If a process dies mid-compile, the job is retried once its lease
+  (`COMPILE_LEASE_MS`, default 30 s) expires, so that paper shows "Compiling…" for up to 30 s longer.

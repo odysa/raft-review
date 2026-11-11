@@ -37,7 +37,30 @@ const DROP_WITH_ARGS = new Set([
   "normalsize", "bfseries", "itshape", "ttfamily", "rmfamily", "sffamily", "mdseries", "upshape", "scshape",
   "color", "definecolor", "graphicspath", "hypersetup", "geometry", "affil", "thanks", "footnotemark",
   "url", // usually typeset in a mono font that breaks across lines; rarely quoted in review
+  "nonumber", "notag", "tag", "hline", "toprule", "midrule", "bottomrule", "cmidrule", "cline", "arraystretch",
 ]);
+
+/** Math commands → the glyph a PDF shows for them. Anything else in math
+ *  drops its name and keeps its argument (\mathbb{R} → R, \frac{a}{b} → ab). */
+const MATH_SYMBOLS: Record<string, string> = {
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ϵ", varepsilon: "ε", zeta: "ζ", eta: "η", theta: "θ",
+  vartheta: "ϑ", iota: "ι", kappa: "κ", lambda: "λ", mu: "μ", nu: "ν", xi: "ξ", pi: "π", varpi: "ϖ", rho: "ρ",
+  varrho: "ϱ", sigma: "σ", varsigma: "ς", tau: "τ", upsilon: "υ", phi: "ϕ", varphi: "φ", chi: "χ", psi: "ψ", omega: "ω",
+  Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ", Pi: "Π", Sigma: "Σ", Upsilon: "Υ", Phi: "Φ", Psi: "Ψ", Omega: "Ω",
+  sum: "∑", prod: "∏", coprod: "∐", int: "∫", iint: "∬", oint: "∮", infty: "∞", times: "×", cdot: "·", pm: "±", mp: "∓",
+  div: "÷", leq: "≤", le: "≤", geq: "≥", ge: "≥", neq: "≠", ne: "≠", approx: "≈", sim: "∼", simeq: "≃", cong: "≅",
+  equiv: "≡", propto: "∝", ll: "≪", gg: "≫", in: "∈", notin: "∉", ni: "∋", subset: "⊂", subseteq: "⊆", supset: "⊃",
+  supseteq: "⊇", cup: "∪", cap: "∩", setminus: "\\", emptyset: "∅", varnothing: "∅", mid: "|", vert: "|", lvert: "|",
+  rvert: "|", Vert: "‖", lVert: "‖", rVert: "‖", to: "→", rightarrow: "→", leftarrow: "←", leftrightarrow: "↔",
+  Rightarrow: "⇒", Leftarrow: "⇐", Leftrightarrow: "⇔", implies: "⇒", iff: "⇔", mapsto: "↦", partial: "∂", nabla: "∇",
+  forall: "∀", exists: "∃", neg: "¬", land: "∧", wedge: "∧", lor: "∨", vee: "∨", cdots: "⋯", ldots: "...", dots: "...",
+  vdots: "⋮", ddots: "⋱", langle: "⟨", rangle: "⟩", lceil: "⌈", rceil: "⌉", lfloor: "⌊", rfloor: "⌋", ell: "ℓ",
+  hbar: "ℏ", top: "⊤", bot: "⊥", perp: "⊥", prime: "′", circ: "∘", odot: "⊙", otimes: "⊗", oplus: "⊕", star: "⋆",
+  ast: "∗", dagger: "†", angle: "∠", triangle: "△", square: "□", sqrt: "√",
+  log: "log", ln: "ln", exp: "exp", max: "max", min: "min", argmax: "argmax", argmin: "argmin", sup: "sup", inf: "inf",
+  lim: "lim", limsup: "limsup", liminf: "liminf", det: "det", dim: "dim", ker: "ker", sin: "sin", cos: "cos", tan: "tan",
+  sinh: "sinh", cosh: "cosh", tanh: "tanh", arg: "arg", deg: "deg", gcd: "gcd", Pr: "Pr", mod: "mod", bmod: "mod",
+};
 
 const MATH_ENVS = new Set([
   "equation", "equation*", "align", "align*", "gather", "gather*", "multline", "multline*", "eqnarray", "eqnarray*",
@@ -70,7 +93,8 @@ function skipSpaces(src: string, i: number): number {
   return i;
 }
 
-/** Project LaTeX to the text a reader would see, with an offset map. */
+/** Project LaTeX to the text a reader would see, with an offset map. Math
+ *  is projected to the glyphs a PDF shows (`x_t` → "xt", `\sum` → "∑"). */
 export function projectLatex(src: string): { text: string; toRaw: number[] } {
   const out: string[] = [];
   const toRaw: number[] = [];
@@ -78,6 +102,9 @@ export function projectLatex(src: string): { text: string; toRaw: number[] } {
     for (const ch of s) { out.push(ch); toRaw.push(at); }
   };
   let i = 0;
+  let inDollar = false;
+  let mathDepth = 0;
+  const inMath = () => inDollar || mathDepth > 0;
   while (i < src.length) {
     const c = src[i];
     if (c === "%") {
@@ -85,19 +112,19 @@ export function projectLatex(src: string): { text: string; toRaw: number[] } {
       continue;
     }
     if (c === "$") {
-      const display = src[i + 1] === "$";
-      const close = display ? "$$" : "$";
-      let j = i + close.length;
-      while (j < src.length && !(src.startsWith(close, j) && src[j - 1] !== "\\")) j++;
+      inDollar = !inDollar;
       emit(" ", i);
-      i = j + close.length;
+      i += src[i + 1] === "$" ? 2 : 1;
       continue;
     }
     if (c === "{" || c === "}") { i++; continue; }
     if (c === "~") { emit(" ", i); i++; continue; }
-    if (c === "`" && src[i + 1] === "`") { emit("\"", i); i += 2; continue; }
-    if (c === "'" && src[i + 1] === "'") { emit("\"", i); i += 2; continue; }
-    if (c === "-" && src[i + 1] === "-") {
+    // Table cell separators.
+    if (c === "&") { emit(" ", i); i++; continue; }
+    if (inMath() && (c === "_" || c === "^")) { i++; continue; }
+    if (!inMath() && c === "`" && src[i + 1] === "`") { emit("\"", i); i += 2; continue; }
+    if (!inMath() && c === "'" && src[i + 1] === "'") { emit("\"", i); i += 2; continue; }
+    if (!inMath() && c === "-" && src[i + 1] === "-") {
       emit("-", i);
       i += src[i + 2] === "-" ? 3 : 2;
       continue;
@@ -112,9 +139,10 @@ export function projectLatex(src: string): { text: string; toRaw: number[] } {
       i += 2;
       if ("%&_#${}".includes(next)) emit(next, start + 1);
       else if (next === "\\") { emit(" ", start); i = skipSpaces(src, i); if (src[i] === "[") i = skipGroup(src, i, "[", "]"); }
-      else if (next === "(") { const j = src.indexOf("\\)", i); emit(" ", start); i = j < 0 ? src.length : j + 2; }
-      else if (next === "[") { const j = src.indexOf("\\]", i); emit(" ", start); i = j < 0 ? src.length : j + 2; }
-      else if (" ,;:!/".includes(next)) emit(" ", start);
+      else if (next === "(" || next === "[") { mathDepth++; emit(" ", start); }
+      else if (next === ")" || next === "]") { mathDepth = Math.max(0, mathDepth - 1); emit(" ", start); }
+      else if (next === "|" && inMath()) emit("‖", start);
+      else if (" ,;:!/>".includes(next)) emit(" ", start);
       // Accents (\' \" \^ \` \~ \= \.): drop, the base letter follows.
       continue;
     }
@@ -130,11 +158,10 @@ export function projectLatex(src: string): { text: string; toRaw: number[] } {
       const close = skipGroup(src, i, "{", "}");
       const env = src.slice(i + 1, close - 1).trim();
       i = close;
-      if (name === "begin" && MATH_ENVS.has(env)) {
-        const endTag = `\\end{${env}}`;
-        const k = src.indexOf(endTag, i);
+      if (MATH_ENVS.has(env)) {
+        if (name === "begin") mathDepth++;
+        else mathDepth = Math.max(0, mathDepth - 1);
         emit(" ", start);
-        i = k < 0 ? src.length : k + endTag.length;
         continue;
       }
       if (name === "begin") {
@@ -146,6 +173,10 @@ export function projectLatex(src: string): { text: string; toRaw: number[] } {
         }
       }
       emit(" ", start);
+      continue;
+    }
+    if (inMath() && name in MATH_SYMBOLS) {
+      emit(MATH_SYMBOLS[name], start);
       continue;
     }
     if (name in WORD_MACROS) {
@@ -235,56 +266,129 @@ export function indexPlain(text: string): TextIndex {
 
 export interface IndexMatch extends Span {
   errors: number;
+  /** How well the surrounding text matched the requested context (0..1). */
+  context: number;
+}
+
+export interface MatchContext {
+  /** Normalized text just before / after the quote on the other side. */
+  before: string;
+  after: string;
 }
 
 const MAX_PATTERN = 256;
+const CONTEXT_CHARS = 80;
 
-/** Find normalized `needle` in `index`; returns a raw span in the indexed text.
- *  `nearRaw` breaks ties toward a raw offset (e.g. a SyncTeX line). */
-export function locate(index: TextIndex, needle: string, nearRaw?: number): IndexMatch | null {
-  if (needle.length < 3 || index.norm.length === 0) return null;
-  const toRawSpan = (s: number, e: number, errors: number): IndexMatch => ({
-    start: index.toRaw[s],
-    end: index.toRaw[e - 1] + 1,
-    errors,
-  });
-  const nearNorm = nearRaw === undefined ? undefined : nearestNorm(index, nearRaw);
-  const dist = (s: number) => (nearNorm === undefined ? 0 : Math.abs(s - nearNorm));
+function trigrams(s: string): Set<string> {
+  const out = new Set<string>();
+  for (let i = 0; i + 3 <= s.length; i++) out.add(s.slice(i, i + 3));
+  return out;
+}
 
-  // Exact first.
-  let best: { s: number; e: number; errors: number } | null = null;
+/** Share of `want`'s trigrams found in `have`: tolerant of the small
+ *  differences between PDF text and projected LaTeX (citations, numbering). */
+function similarity(have: string, want: string): number {
+  const w = trigrams(want);
+  if (w.size === 0) return 0;
+  const h = trigrams(have);
+  let hit = 0;
+  for (const t of w) if (h.has(t)) hit++;
+  return hit / w.size;
+}
+
+interface Hit { s: number; e: number; errors: number }
+
+function searchNorm(norm: string, needle: string): Hit[] {
+  const exact: Hit[] = [];
   for (let from = 0; ;) {
-    const s = index.norm.indexOf(needle, from);
+    const s = norm.indexOf(needle, from);
     if (s < 0) break;
-    if (!best || dist(s) < dist(best.s)) best = { s, e: s + needle.length, errors: 0 };
+    exact.push({ s, e: s + needle.length, errors: 0 });
     from = s + 1;
   }
-  if (best) return toRawSpan(best.s, best.e, 0);
-
+  if (exact.length) return exact;
   if (needle.length <= MAX_PATTERN) {
-    const k = Math.floor(needle.length / 4);
-    for (const hit of approxSearch(index.norm, needle, k)) {
-      if (!best || hit.errors < best.errors || (hit.errors === best.errors && dist(hit.start) < dist(best.s))) {
-        best = { s: hit.start, e: hit.end, errors: hit.errors };
-      }
-    }
-    return best ? toRawSpan(best.s, best.e, best.errors) : null;
+    return approxSearch(norm, needle, Math.floor(needle.length / 4)).map((h) => ({ s: h.start, e: h.end, errors: h.errors }));
   }
   const head = needle.slice(0, MAX_PATTERN / 2);
   const tail = needle.slice(-MAX_PATTERN / 2);
-  const heads = approxSearch(index.norm, head, Math.floor(head.length / 4));
-  const tails = approxSearch(index.norm, tail, Math.floor(tail.length / 4));
+  const heads = approxSearch(norm, head, Math.floor(head.length / 4));
+  const tails = approxSearch(norm, tail, Math.floor(tail.length / 4));
+  const out: Hit[] = [];
   for (const h of heads) {
     for (const t of tails) {
       const length = t.end - h.start;
       if (t.start < h.end || length < needle.length * 0.6 || length > needle.length * 1.4) continue;
-      const errors = h.errors + t.errors + Math.floor(Math.abs(length - needle.length) / 8);
-      if (!best || errors < best.errors || (errors === best.errors && dist(h.start) < dist(best.s))) {
-        best = { s: h.start, e: t.end, errors };
-      }
+      out.push({ s: h.start, e: t.end, errors: h.errors + t.errors + Math.floor(Math.abs(length - needle.length) / 8) });
     }
   }
-  return best ? toRawSpan(best.s, best.e, best.errors) : null;
+  return out;
+}
+
+/** The same index without spaces: PDF math spacing is arbitrary. */
+function compact(index: TextIndex): TextIndex {
+  const cached = (index as TextIndex & { _compact?: TextIndex })._compact;
+  if (cached) return cached;
+  const norm: string[] = [];
+  const toRaw: number[] = [];
+  for (let i = 0; i < index.norm.length; i++) {
+    if (index.norm[i] === " ") continue;
+    norm.push(index.norm[i]);
+    toRaw.push(index.toRaw[i]);
+  }
+  const out = { norm: norm.join(""), toRaw };
+  (index as TextIndex & { _compact?: TextIndex })._compact = out;
+  return out;
+}
+
+/** Find normalized `needle` in `index`; returns a raw span in the indexed text.
+ *  Candidates are ranked by edit errors, then by how well the text around
+ *  them matches `context` (so a repeated phrase resolves to the right
+ *  occurrence), then by distance from `nearRaw` (e.g. a SyncTeX line). */
+export function locate(index: TextIndex, needle: string, nearRaw?: number, context?: MatchContext): IndexMatch | null {
+  if (needle.length < 3 || index.norm.length === 0) return null;
+  const pick = (idx: TextIndex, hits: Hit[], ctxBefore: string, ctxAfter: string): IndexMatch | null => {
+    if (!hits.length) return null;
+    const nearNorm = nearRaw === undefined ? undefined : nearestNorm(idx, nearRaw);
+    let best: (Hit & { ctx: number; dist: number }) | null = null;
+    for (const h of hits) {
+      const ctx = context
+        ? (similarity(idx.norm.slice(Math.max(0, h.s - CONTEXT_CHARS), h.s), ctxBefore) + similarity(idx.norm.slice(h.e, h.e + CONTEXT_CHARS), ctxAfter)) / 2
+        : 0;
+      const dist = nearNorm === undefined ? 0 : Math.abs(h.s - nearNorm);
+      // Context outranks a single edit: one typo shouldn't beat the right place.
+      const better = !best
+        || h.errors - ctx * 2 < best.errors - best.ctx * 2 - 1e-9
+        || (Math.abs((h.errors - ctx * 2) - (best.errors - best.ctx * 2)) < 1e-9
+          && (dist < best.dist || (dist === best.dist && h.e - h.s > best.e - best.s)));
+      if (better) best = { ...h, ctx, dist };
+    }
+    return best ? { start: idx.toRaw[best.s], end: idx.toRaw[best.e - 1] + 1, errors: best.errors, context: best.ctx } : null;
+  };
+  const hits = searchNorm(index.norm, needle);
+  const c = compact(index);
+  const strip = (s: string) => s.replace(/ /g, "");
+  // Only approximate matches? An exact match ignoring spaces is better:
+  // typeset math and table cells differ from LaTeX mostly in spacing.
+  if (!hits.some((h) => h.errors === 0)) {
+    const compactNeedle = strip(needle);
+    const exact = compactNeedle.length >= 3 ? searchNorm(c.norm, compactNeedle).filter((h) => h.errors === 0) : [];
+    if (exact.length) return pick(c, exact, strip(context?.before ?? ""), strip(context?.after ?? ""));
+  }
+  const found = pick(index, hits, context?.before ?? "", context?.after ?? "");
+  if (found) return found;
+  return pick(c, searchNorm(c.norm, strip(needle)), strip(context?.before ?? ""), strip(context?.after ?? ""));
+}
+
+/** Normalized text around a raw span, for use as a MatchContext. */
+export function contextOf(index: TextIndex, span: Span): MatchContext {
+  const s = nearestNorm(index, span.start);
+  let e = s;
+  while (e < index.toRaw.length && index.toRaw[e] < span.end) e++;
+  return {
+    before: index.norm.slice(Math.max(0, s - CONTEXT_CHARS), s),
+    after: index.norm.slice(e, e + CONTEXT_CHARS),
+  };
 }
 
 function nearestNorm(index: TextIndex, raw: number): number {
@@ -310,6 +414,47 @@ export function normalizedSlice(index: TextIndex, span: Span): string {
   return index.norm.slice(s, e);
 }
 
+/** The display-math block ($$…$$, \[…\], or a math environment) that
+ *  contains or neighbours (±2 lines) a source line; else that line's text. */
+export function mathSpanAround(src: string, line: number): Span | null {
+  const blocks: Span[] = [];
+  const envRe = /\\begin\{([a-zA-Z]+\*?)\}/g;
+  for (const m of src.matchAll(envRe)) {
+    if (!MATH_ENVS.has(m[1])) continue;
+    const endTag = `\\end{${m[1]}}`;
+    const close = src.indexOf(endTag, m.index! + m[0].length);
+    if (close >= 0) blocks.push({ start: m.index!, end: close + endTag.length });
+  }
+  for (const [open, close] of [["$$", "$$"], ["\\[", "\\]"]] as const) {
+    for (let from = 0; ;) {
+      const a = src.indexOf(open, from);
+      if (a < 0) break;
+      const b = src.indexOf(close, a + open.length);
+      if (b < 0) break;
+      blocks.push({ start: a, end: b + close.length });
+      from = b + close.length;
+    }
+  }
+  const lineStart = offsetOfLine(src, line);
+  const lineOfOffset = (o: number) => src.slice(0, o).split("\n").length;
+  let best: Span | null = null;
+  let bestDist = Infinity;
+  for (const b of blocks) {
+    const first = lineOfOffset(b.start);
+    const last = lineOfOffset(b.end);
+    const dist = line < first ? first - line : line > last ? line - last : 0;
+    if (dist <= 2 && dist < bestDist) { best = b; bestDist = dist; }
+  }
+  if (best) return best;
+  const nl = src.indexOf("\n", lineStart);
+  const lineEnd = nl < 0 ? src.length : nl;
+  let s = lineStart;
+  let e = lineEnd;
+  while (s < e && /\s/.test(src[s])) s++;
+  while (e > s && /\s/.test(src[e - 1])) e--;
+  return e > s ? { start: s, end: e } : null;
+}
+
 export function offsetOfLine(text: string, line: number): number {
   let offset = 0;
   for (let l = 1; l < line; l++) {
@@ -320,11 +465,54 @@ export function offsetOfLine(text: string, line: number): number {
   return offset;
 }
 
-/** Expand a raw source span to whole words, so a match that lost a letter
- *  to the edit budget never splits a word. */
+/** Make a raw LaTeX span whole: never split a word or a command name,
+ *  balance braces and $…$, and include the command whose argument the span
+ *  starts in (so `L} = …` becomes `\mathcal{L} = …`). */
 export function tidySourceSpan(src: string, span: Span): Span {
   let { start, end } = span;
-  while (start > 0 && /[\p{L}\p{N}]/u.test(src[start - 1]) && /[\p{L}\p{N}]/u.test(src[start])) start--;
-  while (end < src.length && /[\p{L}\p{N}]/u.test(src[end]) && /[\p{L}\p{N}]/u.test(src[end - 1])) end++;
+  const word = /[\p{L}\p{N}]/u;
+  while (start > 0 && word.test(src[start - 1]) && word.test(src[start])) start--;
+  while (end < src.length && word.test(src[end]) && word.test(src[end - 1])) end++;
+  // A command name cut short at either end.
+  const lastSlash = src.lastIndexOf("\\", end - 1);
+  if (lastSlash >= start && /^\\[A-Za-z]*$/.test(src.slice(lastSlash, end))) {
+    while (end < src.length && /[A-Za-z]/.test(src[end])) end++;
+  }
+  for (let guard = 0; guard < 8; guard++) {
+    const before = { start, end };
+    // Unmatched braces: extend outward to their partners.
+    let depth = 0;
+    let minDepth = 0;
+    for (let i = start; i < end; i++) {
+      if (src[i] === "\\") { i++; continue; }
+      if (src[i] === "{") depth++;
+      else if (src[i] === "}") { depth--; minDepth = Math.min(minDepth, depth); }
+    }
+    for (let need = -minDepth; need > 0 && start > 0;) {
+      start--;
+      if (src[start - 1] === "\\") continue;
+      if (src[start] === "}") need++;
+      else if (src[start] === "{") need--;
+    }
+    for (let need = depth - minDepth; need > 0 && end < src.length; end++) {
+      if (src[end] === "\\") { end++; continue; }
+      if (src[end] === "{") need++;
+      else if (src[end] === "}") need--;
+    }
+    // A span opening at `{` belongs to the command before it (with options).
+    const cmd = /\\[A-Za-z]+\*?(?:\[[^\]]*\])?$/.exec(src.slice(Math.max(0, start - 80), start));
+    if (src[start] === "{" && cmd) start -= cmd[0].length;
+    // Odd number of unescaped $: close the math.
+    const dollars = [...src.slice(start, end).matchAll(/(?<!\\)\$/g)].length;
+    if (dollars % 2 === 1) {
+      const next = src.slice(end, end + 200).search(/(?<!\\)\$/);
+      if (next >= 0) end += next + 1;
+      else {
+        const prev = src.slice(Math.max(0, start - 200), start).lastIndexOf("$");
+        if (prev >= 0) start = Math.max(0, start - 200) + prev;
+      }
+    }
+    if (before.start === start && before.end === end) break;
+  }
   return { start, end };
 }

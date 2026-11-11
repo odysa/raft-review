@@ -42,6 +42,9 @@ export interface VersionRow {
   compile_status: string;
   compile_log: string;
   pdf_sha: string | null;
+  compile_owner: string | null;
+  compile_heartbeat: number | null;
+  compile_requested_by: string | null;
 }
 
 export type ThreadStatus = "open" | "resolved" | "orphaned";
@@ -205,6 +208,23 @@ CREATE TABLE IF NOT EXISTS agent_events (
 
 export type Db = DatabaseSync;
 
+/** Switch to WAL once (it persists in the file). SQLite can report the
+ *  conversion as busy without waiting while another process is opening the
+ *  same new database, so retry briefly. */
+function enableWal(db: DatabaseSync): void {
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const mode = (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+      if (mode.toLowerCase() !== "wal") db.exec("PRAGMA journal_mode = WAL;");
+      return;
+    } catch (err) {
+      if (attempt >= 100 || !/locked|busy/i.test((err as Error).message)) throw err;
+      Atomics.wait(pause, 0, 0, 50 + Math.floor(Math.random() * 50));
+    }
+  }
+}
+
 export function openDb(dataDir: string): Db {
   if (dataDir === ":memory:") {
     const db = new DatabaseSync(":memory:");
@@ -212,8 +232,10 @@ export function openDb(dataDir: string): Db {
     return db;
   }
   fs.mkdirSync(dataDir, { recursive: true });
-  const db = new DatabaseSync(path.join(dataDir, "raft-review.sqlite"));
-  db.exec("PRAGMA journal_mode = WAL;");
+  // Wait (instead of failing) while another process holds the lock.
+  const db = new DatabaseSync(path.join(dataDir, "raft-review.sqlite"), { timeout: 10_000 });
+  db.exec("PRAGMA busy_timeout = 10000;");
+  enableWal(db);
   init(db);
   return db;
 }
@@ -259,32 +281,55 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
       ALTER TABLE suggestions ADD COLUMN path TEXT;
     `,
   },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE IF NOT EXISTS changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS rate_limits (
+        key TEXT PRIMARY KEY,
+        tokens REAL NOT NULL,
+        at INTEGER NOT NULL
+      );
+      ALTER TABLE versions ADD COLUMN compile_owner TEXT;
+      ALTER TABLE versions ADD COLUMN compile_heartbeat INTEGER;
+      ALTER TABLE versions ADD COLUMN compile_requested_by TEXT;
+      CREATE INDEX IF NOT EXISTS versions_compile ON versions(compile_status);
+    `,
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.at(-1)!.version;
 
 function init(db: DatabaseSync): void {
   db.exec("PRAGMA foreign_keys = ON;");
-  db.exec("PRAGMA busy_timeout = 5000;");
-  db.exec(SCHEMA);
-  for (const [table, column] of ADDITIVE_COLUMNS) {
-    const name = column.split(" ")[0];
-    const existing = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    if (!existing.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`);
-  }
-  let current = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
-  if (current < 1) {
-    db.exec("PRAGMA user_version = 1");
-    current = 1;
-  }
-  for (const m of MIGRATIONS) {
-    if (m.version <= current) continue;
-    tx(db, () => {
+  db.exec("PRAGMA busy_timeout = 10000;");
+  // Several processes may start at once on a fresh database: do all schema
+  // work under one write lock and decide what to apply only after taking it.
+  tx(db, () => {
+    db.exec(SCHEMA);
+    for (const [table, column] of ADDITIVE_COLUMNS) {
+      const name = column.split(" ")[0];
+      const existing = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!existing.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`);
+    }
+    let current = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+    if (current < 1) {
+      db.exec("PRAGMA user_version = 1");
+      current = 1;
+    }
+    for (const m of MIGRATIONS) {
+      if (m.version <= current) continue;
       db.exec(m.sql);
       db.exec(`PRAGMA user_version = ${m.version}`);
-    });
-    current = m.version;
-  }
+      current = m.version;
+    }
+  });
 }
 
 /** Run `fn` inside a transaction; rolls back on throw. */

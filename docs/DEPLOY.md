@@ -76,7 +76,8 @@ Optional, for instant access removal: in the app's settings in Raft, enable
 | `RAFT_WEBHOOK_SECRET` | — | App Notifications signing secret(s), comma-separated during rotation |
 | `COMPILER` | `auto` | `tectonic`, `none` (agents upload PDFs), or `auto` (Tectonic if installed). The image sets `tectonic`. |
 | `COMPILE_TIMEOUT_MS` | `120000` | Per-compile time limit |
-| `COMPILE_CONCURRENCY` | `2` | Parallel compiles |
+| `COMPILE_CONCURRENCY` | `2` | Parallel compiles per process |
+| `COMPILE_LEASE_MS` | `30000` | A compile whose worker stopped heartbeating this long is retried by another process |
 | `TECTONIC_ONLY_CACHED` | — | `1` = never download TeX packages (air-gapped); only the pre-warmed set is available |
 | `TRUST_PROXY` | — | `1` behind a reverse proxy |
 | `DATA_DIR` | `/data` (image) | SQLite database and nothing else |
@@ -107,8 +108,18 @@ startup and are tracked in `PRAGMA user_version`; take a backup first. Shutdown
 is graceful: on `SIGTERM` the server stops accepting connections, closes live
 updates, lets running compiles finish (up to 30 s), and closes the database.
 
-**Scaling:** one instance per database. Rate limits and live-update streams are
-in memory. Compiles are the heavy part; raise `COMPILE_CONCURRENCY` with CPU.
+**Scaling:** run several processes or containers on the same data volume for more
+compile throughput, e.g. `docker compose up -d --scale raft-review=3` behind your
+proxy (drop the fixed host port mapping first).
+- **Compiles:** a durable queue in SQLite. Each job is claimed by exactly one
+  process, which heartbeats while it compiles. A job whose worker died is reclaimed
+  after `COMPILE_LEASE_MS` (30 s), so restarts and crashes never strand a paper in
+  "Compiling…".
+- **Live updates and rate limits:** shared through the database, so a viewer
+  connected to any process sees changes made through any other, and limits hold
+  across all of them.
+
+All processes must share one volume (SQLite). `COMPILE_CONCURRENCY` is per process.
 
 ## Security model
 

@@ -35,7 +35,12 @@ already has a supported extension point that fits this feature exactly:
 Raft's built-in attachment comments are read-only for agents (`raft attachment comments`)
 and have no suggestion/accept flow, so the app adds that layer without forking Raft.
 
-## Run locally (no Raft needed)
+## Run locally
+
+**Full guide: [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md)** covers dev mode, a local app against your
+raft.build server through a tunnel, a fully local Raft from source, and troubleshooting.
+
+Quick start (no Raft needed):
 
 Requires Node 24 (uses the built-in `node:sqlite` and TypeScript type stripping; no runtime dependencies).
 
@@ -43,6 +48,7 @@ Requires Node 24 (uses the built-in `node:sqlite` and TypeScript type stripping;
 npm install        # dev-only: typescript + @types/node for `npm run typecheck`
 npm run dev        # http://localhost:8787 with dev sign-in (human or agent)
 npm test           # unit + end-to-end tests against a mock Raft API
+npm run typecheck
 ```
 
 Dev sign-in is only enabled when `RAFT_REVIEW_DEV_LOGIN=1` **and** `PUBLIC_URL` is localhost.
@@ -66,14 +72,14 @@ Dev sign-in is only enabled when `RAFT_REVIEW_DEV_LOGIN=1` **and** `PUBLIC_URL` 
 
    The client secret is delivered once to the owning agent; put it in the
    app's secret store and never paste it into chat.
-3. Configure the app:
+3. Configure the app (copy `.env.example` to `.env`, then `npm run start:env`):
 
    | Variable | Meaning |
    | --- | --- |
    | `PUBLIC_URL` | `https://review.example.com` (must match the registered redirect origin byte-for-byte) |
    | `RAFT_API_URL` | `https://api.raft.build` (default) |
    | `RAFT_CLIENT_ID` / `RAFT_CLIENT_SECRET` | from registration |
-   | `RAFT_SERVER_ID` | your Raft Server ID; used for the `agent-inbound` resource on agent tokens |
+   | `RAFT_SERVER_ID` | optional; your Raft Server ID for the `agent-inbound` resource on agent tokens (learned from the first human sign-in when unset) |
    | `RAFT_SERVICE_KEY` | key agents pass to `--service` (defaults to the client ID) |
    | `DATA_DIR` | where the SQLite database lives (default `./data`) |
    | `PORT` | default `8787` |
@@ -90,7 +96,9 @@ Dev sign-in is only enabled when `RAFT_REVIEW_DEV_LOGIN=1` **and** `PUBLIC_URL` 
 ### Waking agents
 
 On each human comment the app asks Raft for an agent token
-(`/api/oauth/requests/agent`, client credentials) and posts an Agent Event. This
+(`/api/oauth/requests/agent`, client credentials, scope `agent:event:write` only)
+and posts an Agent Event. The one-line `summary` is all the agent sees (`payload`
+is deprecated), so it carries the exact next command to run. This
 needs no human only while the agent holds a *remembered* grant that includes
 `agent:event:write`. Otherwise Raft answers `pending`, the attempt is logged in
 `agent_events`, and the agent still finds the thread with `list_pending`. In
@@ -121,16 +129,39 @@ src/server.ts    HTTP routes, sessions, SSE live updates
 public/          web client (vanilla JS, PDF.js from cdnjs)
 ```
 
+## Best practices followed
+
+Checked against Raft's [Build a Raft App](https://docs.raft.build/developers/raft-apps/build/) and
+[Login with Raft](https://docs.raft.build/developers/login-with-raft/) contracts, Raft's reference apps,
+and the [W3C Web Annotation model](https://www.w3.org/TR/annotation-model/) used by tools like Hypothesis.
+
+| Practice | Source | How |
+| --- | --- | --- |
+| Cache identity/membership for **at most 60 s**; never authorize from a role stored at login | Login with Raft | Sessions keep the Raft access token server-side and re-call `userinfo` when the last check is over 60 s old; a 401 ends the session |
+| No session outlives its access token (1 h, no refresh token) | Login with Raft | Session cookie lifetime = token lifetime; the UI sends you back through sign-in to the same document |
+| Login-init state lives on your side, bound to the browser | Login with Raft | PKCE S256 + `state` stored server-side and in a short-lived `HttpOnly` cookie, checked together (stops login CSRF) |
+| Stateless agent callback; prove agent identity from `userinfo.type`, never from missing state | Login with Raft | No-state callbacks are accepted only when `userinfo.type === "agent"` |
+| Session cookie minted on the callback response with `Path=/` | Login with Raft | Covers every manifest action path |
+| Typed JSON errors `{error, hint}` on rejected handoffs | Login with Raft | The Raft CLI shows them to the agent as `Service response: …` |
+| Event `summary` is all the agent sees | Build a Raft App | Next command in the summary, empty payload; user text quoted as data |
+| Least-privilege scopes | OAuth / Raft scope coverage | Wake-up token requests only `agent:event:write` |
+| Client secret server-side only | Build a Raft App | Read from env; never sent to the browser |
+| Robust anchoring: quote **and** position selectors | W3C Web Annotation | Threads store `start/end` plus `quote`, `prefix`, `suffix` (32 chars); re-anchoring picks the occurrence whose context matches best |
+
 ## Security notes
 
 - Sessions are random 256-bit tokens stored hashed; cookies are `HttpOnly`,
   `SameSite=Lax`, and `Secure` on HTTPS, with `Path=/` so the Raft CLI sends them on every action.
+- Raft access tokens are stored server-side in SQLite so sessions can be re-verified. Protect `DATA_DIR`.
 - State-changing routes require `application/json` and refuse foreign `Origin`s.
 - Documents are scoped to the Raft Server of the signed-in principal; other
   servers get 404, never 403, so document IDs cannot be probed.
 - Only humans can accept or reject suggestions.
 
 ## Limits / next steps
+
+- Re-anchoring after a full new version needs the exact quote to survive. Hypothesis-style fuzzy matching (e.g. diff-match-patch) would recover lightly edited passages.
+- Sessions aren't ended in real time when someone is removed; that takes up to 60 s. Subscribing to `server.member_removed` App Notifications would make it immediate.
 
 - PDFs cannot be edited in place. Pair the PDF with its LaTeX source as a second document to apply edits.
 - Highlights in PDFs follow PDF.js text-item geometry, so some fonts may draw them a little off.

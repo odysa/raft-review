@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadConfig, type Config } from "./config.ts";
-import { get, openDb, run, type Db, type User } from "./db.ts";
+import { all, get, openDb, run, type Db, type User } from "./db.ts";
 import { buildManifest } from "./manifest.ts";
 import { createRaftNotifier, recentAgentEvents, type Notifier, type NotifyReason } from "./notify.ts";
 import { newPkce, RaftClient, RaftError, type RaftUserinfo } from "./raft.ts";
@@ -33,8 +33,11 @@ import {
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../public");
 const SESSION_COOKIE = "rr_session";
-const HUMAN_SESSION_SECONDS = 7 * 24 * 3600;
-const AGENT_SESSION_SECONDS = 24 * 3600;
+const LOGIN_STATE_COOKIE = "rr_login";
+// Raft access tokens last an hour and there is no refresh token, so an app
+// session cannot outlive the token it re-verifies with.
+const MAX_SESSION_SECONDS = 3600;
+const DEV_SESSION_SECONDS = 7 * 24 * 3600;
 const STATE_TTL_MS = 10 * 60 * 1000;
 const MAX_JSON_BYTES = 40 * 1024 * 1024;
 
@@ -131,9 +134,13 @@ export interface AppDeps {
 
 export function createApp(config: Config, deps: AppDeps = {}) {
   const db = deps.db ?? openDb(config.dataDir);
-  const raft = new RaftClient(config, deps.fetchImpl);
+  const raft = new RaftClient(config, deps.fetchImpl, () => {
+    const servers = all<{ server_id: string }>(db, "SELECT DISTINCT server_id FROM users WHERE id NOT LIKE 'dev-%'");
+    return servers.length === 1 ? servers[0].server_id : null;
+  });
   const notifier = deps.notifier ?? createRaftNotifier(db, config, raft);
   const secureCookies = config.publicUrl.startsWith("https://");
+  const membershipTtlMs = config.membershipTtlMs ?? 60_000;
   const pendingNotifications = new Set<Promise<unknown>>();
 
   // ---------- live updates (SSE) ----------
@@ -147,18 +154,39 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secureCookies ? "; Secure" : ""}`;
   }
 
-  function startSession(user: User, seconds: number): string {
+  /** Session bound to the principal's Raft access token, kept server-side so
+   *  identity and membership can be re-checked (Raft allows caching them for
+   *  at most 60 seconds). Dev sessions have no token. */
+  function startSession(user: User, accessToken: string | null, tokenSeconds: number): string {
+    const seconds = accessToken ? Math.max(60, Math.min(tokenSeconds - 30, MAX_SESSION_SECONDS)) : DEV_SESSION_SECONDS;
     const token = randomBytes(32).toString("base64url");
-    run(db, "INSERT INTO sessions (id_hash, user_id, expires_at) VALUES (?, ?, ?)", sha256(token), user.id, Date.now() + seconds * 1000);
+    run(db, "INSERT INTO sessions (id_hash, user_id, expires_at, access_token, verified_at) VALUES (?, ?, ?, ?, ?)",
+      sha256(token), user.id, Date.now() + seconds * 1000, accessToken, Date.now());
     run(db, "DELETE FROM sessions WHERE expires_at < ?", Date.now());
     return sessionCookie(token, seconds);
   }
 
-  function sessionUser(req: Req): User | null {
+  async function sessionUser(req: Req): Promise<User | null> {
     const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
     if (!token) return null;
-    const row = get<{ user_id: string; expires_at: number }>(db, "SELECT user_id, expires_at FROM sessions WHERE id_hash = ?", sha256(token));
+    const idHash = sha256(token);
+    const row = get<{ user_id: string; expires_at: number; access_token: string | null; verified_at: number }>(
+      db, "SELECT user_id, expires_at, access_token, verified_at FROM sessions WHERE id_hash = ?", idHash,
+    );
     if (!row || row.expires_at < Date.now()) return null;
+    if (row.access_token && Date.now() - row.verified_at > membershipTtlMs) {
+      try {
+        const info = await raft.userinfo(row.access_token);
+        if (info.sub !== row.user_id) throw new RaftError("principal changed", 401, null);
+        userFromInfo(info);
+        run(db, "UPDATE sessions SET verified_at = ? WHERE id_hash = ?", Date.now(), idHash);
+      } catch (err) {
+        // Revoked token, lost membership, uninstalled app → end the session.
+        // Anything else (Raft unreachable) fails closed for this request only.
+        if (err instanceof RaftError && err.status === 401) run(db, "DELETE FROM sessions WHERE id_hash = ?", idHash);
+        return null;
+      }
+    }
     return getUser(db, row.user_id) ?? null;
   }
 
@@ -249,14 +277,20 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     run(db, "DELETE FROM oauth_states WHERE created_at < ?", Date.now() - STATE_TTL_MS);
     run(db, "INSERT INTO oauth_states (state, verifier, return_to, created_at) VALUES (?, ?, ?, ?)",
       state, verifier, returnTo.startsWith("/") && !returnTo.startsWith("//") ? returnTo : "/", Date.now());
-    res.writeHead(302, { location: raft.authorizeUrl(state, challenge), "cache-control": "no-store" });
+    // Bind the pending login to this browser so a callback URL cannot be
+    // replayed into someone else's browser (login CSRF).
+    res.writeHead(302, {
+      location: raft.authorizeUrl(state, challenge),
+      "cache-control": "no-store",
+      "set-cookie": `${LOGIN_STATE_COOKIE}=${state}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=${STATE_TTL_MS / 1000}${secureCookies ? "; Secure" : ""}`,
+    });
     res.end();
   });
 
   // One callback for both swimlanes. A browser arrives with code+state;
   // `raft integration login` arrives with only ?code=<request id> and needs
   // a Set-Cookie session that covers every action path (Path=/).
-  route("GET", "/auth/callback", async ({ res, url }) => {
+  route("GET", "/auth/callback", async ({ req, res, url }) => {
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
     const error = url.searchParams.get("error");
@@ -268,14 +302,22 @@ export function createApp(config: Config, deps: AppDeps = {}) {
         db, "SELECT verifier, return_to, created_at FROM oauth_states WHERE state = ?", state,
       );
       run(db, "DELETE FROM oauth_states WHERE state = ?", state);
-      if (!row || row.created_at < Date.now() - STATE_TTL_MS) {
-        throw new HttpError(400, "invalid_state", "sign-in expired; start again", "/auth/login");
+      const browserState = parseCookies(req.headers.cookie)[LOGIN_STATE_COOKIE];
+      if (!row || row.created_at < Date.now() - STATE_TTL_MS || browserState !== state) {
+        throw new HttpError(400, "invalid_state", "sign-in expired or was started in another browser; start again", "/auth/login");
       }
       const token = await raft.exchangeHumanCode(code, row.verifier);
       const info = await raft.userinfo(token.access_token);
       if (info.type !== "human") throw new HttpError(400, "unexpected_principal", "browser sign-in must be a human");
       const user = userFromInfo(info);
-      res.writeHead(302, { location: row.return_to, "set-cookie": startSession(user, HUMAN_SESSION_SECONDS), "cache-control": "no-store" });
+      res.writeHead(302, {
+        location: row.return_to,
+        "set-cookie": [
+          startSession(user, token.access_token, token.expires_in),
+          `${LOGIN_STATE_COOKIE}=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0${secureCookies ? "; Secure" : ""}`,
+        ],
+        "cache-control": "no-store",
+      });
       res.end();
       return;
     }
@@ -288,7 +330,7 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     const user = userFromInfo(info);
     res.writeHead(200, {
       "content-type": "application/json; charset=utf-8",
-      "set-cookie": startSession(user, AGENT_SESSION_SECONDS),
+      "set-cookie": startSession(user, token.access_token, token.expires_in),
       "cache-control": "no-store",
     });
     res.end(JSON.stringify({ ok: true, principal: { id: user.id, type: user.type, name: user.name } }));
@@ -312,13 +354,14 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       type, name, username: name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
       avatar_url: null, server_id: "dev-server", server_slug: "dev",
     });
-    res.writeHead(200, { "content-type": "application/json", "set-cookie": startSession(user, HUMAN_SESSION_SECONDS) });
+    res.writeHead(200, { "content-type": "application/json", "set-cookie": startSession(user, null, 0) });
     res.end(JSON.stringify({ ok: true, user }));
   });
 
   route("GET", "/api/me", (ctx) => {
     json(ctx.res, 200, {
       user: ctx.user,
+      server_id: ctx.user?.server_id ?? null,
       dev_login: config.devLogin,
       service_key: config.serviceKey,
     });
@@ -530,7 +573,7 @@ export function createApp(config: Config, deps: AppDeps = {}) {
         if (!m) continue;
         const params: Record<string, string> = {};
         r.keys.forEach((key, i) => { params[key] = decodeURIComponent(m[i + 1]); });
-        await r.handler({ req, res, url, params, user: sessionUser(req) });
+        await r.handler({ req, res, url, params, user: await sessionUser(req) });
         return;
       }
       if (req.method === "GET") {
@@ -553,6 +596,10 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       } else if (err instanceof RaftError) {
         // Surface Raft's own reason: the CLI prints `Service response: <code> — <hint>`.
         const upstream = (err.body as any)?.error ?? `HTTP ${err.status}`;
+        if (err.status === 400 && /Server ID/.test(err.message)) {
+          json(res, 409, { error: "server_id_unknown", hint: err.message });
+          return;
+        }
         json(res, 502, { error: "raft_exchange_failed", hint: `${err.message}: ${String(upstream).slice(0, 200)}` });
       } else {
         console.error("[raft-review] unexpected error", err);

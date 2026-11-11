@@ -100,6 +100,7 @@ before(async () => {
   const config: Config = {
     port: 0, publicUrl: base, raftApiUrl: raftUrl, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
     raftServerId: SERVER_ID, dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID,
+    membershipTtlMs: 0, // re-verify with Raft on every request in tests
   };
   app = createApp(config, { db: openDb(":memory:") });
 });
@@ -141,12 +142,24 @@ test("agent login handoff, human login, comment → event → agent suggestion �
   assert.equal(authorize.searchParams.get("code_challenge_method"), "S256");
   assert.equal(authorize.searchParams.get("redirect_uri"), `${base}/auth/callback`);
   lastChallenge = authorize.searchParams.get("code_challenge")!;
-  const cb = await fetch(`${base}/auth/callback?code=human-code&state=${authorize.searchParams.get("state")}`, { redirect: "manual" });
+  const loginCookie = login.headers.getSetCookie()[0].split(";")[0];
+  const callbackUrl = `${base}/auth/callback?code=human-code&state=${authorize.searchParams.get("state")}`;
+  // Login CSRF: the same callback opened in a browser that did not start the
+  // login is refused (and burns the state).
+  const login2 = await fetch(`${base}/auth/login`, { redirect: "manual" });
+  const state2 = new URL(login2.headers.get("location")!).searchParams.get("state");
+  const csrf = await fetch(`${base}/auth/callback?code=human-code&state=${state2}`, { redirect: "manual", headers: { cookie: loginCookie } });
+  assert.equal(csrf.status, 400);
+  assert.equal((await csrf.json()).error, "invalid_state");
+
+  const cb = await fetch(callbackUrl, { redirect: "manual", headers: { cookie: loginCookie } });
   assert.equal(cb.status, 302);
   const humanCookie = cookieFrom(cb);
+  assert.match(cb.headers.getSetCookie()[0], /Max-Age=(\d+)/);
+  assert.ok(Number(/Max-Age=(\d+)/.exec(cb.headers.getSetCookie()[0])![1]) <= 3600, "session never outlives the 1 h access token");
 
   // A replayed state is refused.
-  const replay = await fetch(`${base}/auth/callback?code=human-code&state=${authorize.searchParams.get("state")}`, { redirect: "manual" });
+  const replay = await fetch(callbackUrl, { redirect: "manual", headers: { cookie: loginCookie } });
   assert.equal(replay.status, 400);
 
   // Agent publishes its draft (upload_document action).
@@ -164,8 +177,9 @@ test("agent login handoff, human login, comment → event → agent suggestion �
   const threadId = th.json.thread.id;
   await app.settle();
   assert.equal(events.length, 1, "reviewer agent is woken");
-  assert.equal(events[0].payload.thread_id, threadId);
-  assert.match(events[0].summary, /get_thread --param thread_id=/);
+  assert.ok(events[0].summary.includes(threadId));
+  assert.match(events[0].summary, /get_thread --param thread_id=/, "the summary alone tells the agent what to run");
+  assert.deepEqual(events[0].payload, {}, "payload is deprecated; nothing relies on it");
 
   // Agent: list_pending → get_thread → reply + suggest_edit.
   const pending = await call(agentCookie, "GET", "/api/inbox");
@@ -191,11 +205,49 @@ test("agent login handoff, human login, comment → event → agent suggestion �
   assert.equal(acc.json.document.current_version, 2);
   await app.settle();
   assert.equal(events.length, 2);
-  assert.equal(events[1].payload.reason, "suggestion_accepted");
+  assert.match(events[1].summary, /accepted your suggestion/);
 
   // Download reflects the accepted change.
   const raw = await fetch(`${base}/api/documents/${docId}/raw`, { headers: { cookie: agentCookie } });
   assert.equal(await raw.text(), acc.json.document.text);
+
+  // Revocation / removal in Raft: userinfo starts answering 401, and the
+  // app session ends on the next request instead of living on.
+  const saved = identities["tok-human"];
+  delete identities["tok-human"];
+  const revoked = await call(humanCookie, "GET", "/api/documents");
+  assert.equal(revoked.status, 401);
+  identities["tok-human"] = saved;
+  const stillGone = await call(humanCookie, "GET", "/api/documents");
+  assert.equal(stillGone.status, 401, "a revoked session is deleted, not paused");
+});
+
+test("without RAFT_SERVER_ID the app learns the server from the first human", async () => {
+  const db = openDb(":memory:");
+  const raftUrl = `http://127.0.0.1:${(mockRaft.address() as AddressInfo).port}`;
+  let app2!: ReturnType<typeof createApp>;
+  const srv = http.createServer((req, res) => void app2.handle(req, res));
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const base2 = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  app2 = createApp({ port: 0, publicUrl: base2, raftApiUrl: raftUrl, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
+    raftServerId: "", dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID }, { db });
+  try {
+    const early = await fetch(`${base2}/auth/callback?code=login-req`, { redirect: "manual" });
+    assert.equal(early.status, 409);
+    assert.match((await early.json()).hint, /RAFT_SERVER_ID/, "the CLI shows the agent why");
+
+    const login = await fetch(`${base2}/auth/login`, { redirect: "manual" });
+    const authorize = new URL(login.headers.get("location")!);
+    lastChallenge = authorize.searchParams.get("code_challenge")!;
+    const cb = await fetch(`${base2}/auth/callback?code=human-code&state=${authorize.searchParams.get("state")}`,
+      { redirect: "manual", headers: { cookie: login.headers.getSetCookie()[0].split(";")[0] } });
+    assert.equal(cb.status, 302);
+
+    const agentRes = await fetch(`${base2}/auth/callback?code=login-req`, { redirect: "manual" });
+    assert.equal(agentRes.status, 200);
+  } finally {
+    srv.close();
+  }
 });
 
 test("unauthenticated and cross-origin requests are refused", async () => {

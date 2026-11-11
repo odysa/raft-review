@@ -45,6 +45,8 @@ export interface ThreadRow {
   start: number;
   end: number;
   quote: string;
+  prefix: string;
+  suffix: string;
   status: ThreadStatus;
   created_by: string;
   created_at: number;
@@ -99,7 +101,9 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   id_hash TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id),
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  access_token TEXT,
+  verified_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS oauth_states (
   state TEXT PRIMARY KEY,
@@ -134,6 +138,8 @@ CREATE TABLE IF NOT EXISTS threads (
   start INTEGER NOT NULL,
   "end" INTEGER NOT NULL,
   quote TEXT NOT NULL,
+  prefix TEXT NOT NULL DEFAULT '',
+  suffix TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL,
@@ -188,9 +194,22 @@ export function openDb(dataDir: string): Db {
   return db;
 }
 
+// Columns added after the first release; ALTER is a no-op error when present.
+const ADDITIVE_COLUMNS: Array<[string, string]> = [
+  ["sessions", "access_token TEXT"],
+  ["sessions", "verified_at INTEGER NOT NULL DEFAULT 0"],
+  ["threads", "prefix TEXT NOT NULL DEFAULT ''"],
+  ["threads", "suffix TEXT NOT NULL DEFAULT ''"],
+];
+
 function init(db: DatabaseSync): void {
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(SCHEMA);
+  for (const [table, column] of ADDITIVE_COLUMNS) {
+    const name = column.split(" ")[0];
+    const existing = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!existing.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`);
+  }
 }
 
 /** Run `fn` inside a transaction; rolls back on throw. */

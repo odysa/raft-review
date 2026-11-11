@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node src/server.ts",
+    "start:env": "node --env-file=.env src/server.ts",
     "dev": "RAFT_REVIEW_DEV_LOGIN=1 node --watch src/server.ts",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

@@ -49,6 +49,17 @@ test("reanchor finds moved quote or reports orphan", () => {
   assert.equal(reanchor("goodbye", anchor), null);
 });
 
+test("reanchor uses prefix/suffix context to pick the right repeated quote", () => {
+  const before = "Intro. The model is fast. Results: the model is fast. End.";
+  const start = before.lastIndexOf("model is fast");
+  const anchor = { start, end: start + 13, quote: "model is fast", prefix: "Results: the ", suffix: ". End." };
+  // A long insertion at the top moves both occurrences; the nearer-by-offset
+  // one is now the first, but the context still identifies the second.
+  const after = "A much longer new introduction paragraph. The model is fast. Results: the model is fast. End.";
+  const span = reanchor(after, anchor)!;
+  assert.equal(after.slice(span.start - 13, span.start), "Results: the ");
+});
+
 test("pageOf counts form feeds", () => {
   const text = "p1\fp2 text\fp3";
   assert.equal(pageOf(text, 0), 1);

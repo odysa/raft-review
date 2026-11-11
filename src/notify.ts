@@ -61,27 +61,10 @@ export function createRaftNotifier(db: Db, config: Config, raft: RaftClient): No
         : `raft integration invoke --service ${svc} --action get_document --param document_id=${input.documentId}`;
       const summary = clip(
         `${input.actor.name} ${REASON_TEXT[input.reason]} “${clip(input.documentTitle, 80)}”`
-          + (input.body ? `: ${clip(input.body, 200)}` : "")
+          + (input.body ? `: “${clip(input.body, 200)}”` : "")
           + `. Next: ${target}`,
         500,
       );
-      const payload = {
-        app: "raft-review",
-        reason: input.reason,
-        document_id: input.documentId,
-        document_title: input.documentTitle,
-        document_url: `${config.publicUrl}/#/doc/${input.documentId}`,
-        thread_id: input.threadId,
-        quote: input.quote ? clip(input.quote, 1000) : undefined,
-        comment: input.body ? clip(input.body, 4000) : undefined,
-        actor: { id: input.actor.id, name: input.actor.name, type: input.actor.type },
-        next_steps: [
-          target,
-          `Reply: raft integration invoke --service ${svc} --action reply --param thread_id=<id> --param body=@reply.md`,
-          `Suggest an edit: raft integration invoke --service ${svc} --action suggest_edit --param thread_id=<id> --param replacement=@new.txt --param rationale="…"`,
-          `Everything waiting on you: raft integration invoke --service ${svc} --action list_pending`,
-        ],
-      };
       try {
         const token = await raft.agentEventToken(agent);
         if (!token) {
@@ -89,7 +72,7 @@ export function createRaftNotifier(db: Db, config: Config, raft: RaftClient): No
           log("no_grant", detail);
           return { status: "no_grant", detail };
         }
-        const res = await raft.postAgentEvent(token, { summary, payload, externalEventId: `raft-review:${input.dedupeKey}` });
+        const res = await raft.postAgentEvent(token, { summary, externalEventId: `raft-review:${input.dedupeKey}` });
         if (res.status === 200 || res.status === 202) {
           const status = res.json?.status === "duplicate" ? "duplicate" : "queued";
           log(status, `event ${res.json?.id ?? "?"}`);

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   applyEdit,
   contextAround,
+  contextFor,
   findQuote,
   isValidSpan,
   lineOf,
@@ -215,7 +216,9 @@ export function addVersion(db: Db, user: User, documentId: string, input: {
     for (const thread of all<ThreadRow>(db, "SELECT * FROM threads WHERE document_id = ? AND status != 'resolved'", doc.id)) {
       const span = reanchor(text, thread);
       if (span) {
-        run(db, `UPDATE threads SET start = ?, "end" = ?, status = 'open', updated_at = ? WHERE id = ?`, span.start, span.end, t, thread.id);
+        const ctx = contextFor(text, span);
+        run(db, `UPDATE threads SET start = ?, "end" = ?, prefix = ?, suffix = ?, status = 'open', updated_at = ? WHERE id = ?`,
+          span.start, span.end, ctx.prefix, ctx.suffix, t, thread.id);
       } else {
         run(db, "UPDATE threads SET status = 'orphaned', updated_at = ? WHERE id = ?", t, thread.id);
       }
@@ -281,12 +284,13 @@ export function createThread(db: Db, user: User, documentId: string, input: Anch
   const body = requireText(input.body, "body");
   const id = randomUUID();
   const t = now();
+  const ctx = contextFor(text, span);
   tx(db, () => {
     run(
       db,
-      `INSERT INTO threads (id, document_id, start, "end", quote, status, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
-      id, doc.id, span.start, span.end, text.slice(span.start, span.end), user.id, t, t,
+      `INSERT INTO threads (id, document_id, start, "end", quote, prefix, suffix, status, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
+      id, doc.id, span.start, span.end, text.slice(span.start, span.end), ctx.prefix, ctx.suffix, user.id, t, t,
     );
     insertComment(db, id, user.id, body, t);
     if (typeof input.replacement === "string") {
@@ -424,7 +428,9 @@ export function decideSuggestion(db: Db, user: User, suggestionId: string, decis
       run(db, "UPDATE suggestions SET status = 'accepted', decided_by = ?, decided_at = ? WHERE id = ?", user.id, t, suggestion.id);
       for (const other of all<ThreadRow>(db, "SELECT * FROM threads WHERE document_id = ? AND status != 'orphaned'", doc.id)) {
         const mapped = mapSpanThroughEdit(other, edit);
-        run(db, `UPDATE threads SET start = ?, "end" = ?, quote = ? WHERE id = ?`, mapped.start, mapped.end, next.slice(mapped.start, mapped.end), other.id);
+        const ctx = contextFor(next, mapped);
+        run(db, `UPDATE threads SET start = ?, "end" = ?, quote = ?, prefix = ?, suffix = ? WHERE id = ?`,
+          mapped.start, mapped.end, next.slice(mapped.start, mapped.end), ctx.prefix, ctx.suffix, other.id);
       }
       for (const other of pendingSuggestions(db, doc.id)) {
         const overlaps = other.start < span.end && span.start < other.end;

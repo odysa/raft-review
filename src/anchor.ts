@@ -65,12 +65,60 @@ export function findQuote(
   return { start, end: start + quote.length };
 }
 
-/** Re-place an anchor in new text: keep it if the quote is still at the same
- *  offsets, else search for the quote nearest the old position. Returns null
- *  when the quoted text no longer exists (the thread becomes orphaned). */
-export function reanchor(text: string, anchor: Span & { quote: string }): Span | null {
+/** Characters of context kept on each side of an anchor, as in the W3C Web
+ *  Annotation TextQuoteSelector (exact + prefix + suffix). */
+export const CONTEXT_CHARS = 32;
+
+export interface QuoteAnchor extends Span {
+  quote: string;
+  prefix?: string;
+  suffix?: string;
+}
+
+export function contextFor(text: string, span: Span): { prefix: string; suffix: string } {
+  return {
+    prefix: text.slice(Math.max(0, span.start - CONTEXT_CHARS), span.start),
+    suffix: text.slice(span.end, span.end + CONTEXT_CHARS),
+  };
+}
+
+function commonSuffixLength(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[a.length - 1 - n] === b[b.length - 1 - n]) n++;
+  return n;
+}
+
+function commonPrefixLength(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[n] === b[n]) n++;
+  return n;
+}
+
+/** Re-place an anchor in new text, combining a position selector with a
+ *  quote selector (the W3C annotation model's recommendation): keep it if the
+ *  quote is still at the same offsets; otherwise pick the occurrence whose
+ *  surrounding text best matches the stored prefix/suffix, breaking ties by
+ *  distance from the old position. Returns null when the quoted text no longer
+ *  exists (the thread becomes orphaned). */
+export function reanchor(text: string, anchor: QuoteAnchor): Span | null {
   if (text.slice(anchor.start, anchor.end) === anchor.quote) return { start: anchor.start, end: anchor.end };
-  return findQuote(text, anchor.quote, { near: anchor.start });
+  const hits = quoteOccurrences(text, anchor.quote);
+  if (hits.length === 0) return null;
+  let best = hits[0];
+  let bestScore = -1;
+  let bestDistance = Infinity;
+  for (const start of hits) {
+    const end = start + anchor.quote.length;
+    const score = (anchor.prefix ? commonSuffixLength(text.slice(Math.max(0, start - anchor.prefix.length), start), anchor.prefix) : 0)
+      + (anchor.suffix ? commonPrefixLength(text.slice(end, end + anchor.suffix.length), anchor.suffix) : 0);
+    const distance = Math.abs(start - anchor.start);
+    if (score > bestScore || (score === bestScore && distance < bestDistance)) {
+      best = start;
+      bestScore = score;
+      bestDistance = distance;
+    }
+  }
+  return { start: best, end: best + anchor.quote.length };
 }
 
 export function applyEdit(text: string, span: Span, replacement: string): string {

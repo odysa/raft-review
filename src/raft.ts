@@ -66,10 +66,14 @@ export function agentInboundResource(serverId: string): string {
 export class RaftClient {
   private config: Config;
   private fetchImpl: typeof fetch;
+  private serverIdHint: () => string | null;
 
-  constructor(config: Config, fetchImpl: typeof fetch = fetch) {
+  /** `serverIdHint` supplies the Raft Server ID when RAFT_SERVER_ID is unset:
+   *  a server-local App learns it from the first principal that signs in. */
+  constructor(config: Config, fetchImpl: typeof fetch = fetch, serverIdHint: () => string | null = () => null) {
     this.config = config;
     this.fetchImpl = fetchImpl;
+    this.serverIdHint = serverIdHint;
   }
 
   authorizeUrl(state: string, challenge: string): string {
@@ -128,8 +132,12 @@ export class RaftClient {
       ...(resource ? { resource } : {}),
     }, this.basicAuth());
     let { status, json } = await attempt();
-    if (status === 400 && /resource/i.test(String(json?.error ?? "")) && this.config.raftServerId) {
-      ({ status, json } = await attempt(agentInboundResource(this.config.raftServerId)));
+    const serverId = this.config.raftServerId || this.serverIdHint();
+    if (status === 400 && /resource/i.test(String(json?.error ?? "")) && serverId) {
+      ({ status, json } = await attempt(agentInboundResource(serverId)));
+    }
+    if (status === 400 && /resource is required/i.test(String(json?.error ?? "")) && !serverId) {
+      throw new RaftError("agent login asked for agent:event:write before this app knows its Raft Server ID (set RAFT_SERVER_ID, or have a human sign in first)", status, json);
     }
     if (status !== 200 || !json?.access_token) throw new RaftError("agent token exchange failed", status, json);
     return json;
@@ -169,13 +177,14 @@ export class RaftClient {
 
   async postAgentEvent(accessToken: string, event: {
     summary: string;
-    payload: Record<string, unknown>;
     externalEventId: string;
   }): Promise<{ status: number; json: any }> {
+    // The summary is all the agent sees; `payload` is deprecated, so every
+    // instruction the agent needs lives in the summary.
     return this.post("/api/oauth/agent-events", {
       kind: "event",
       summary: event.summary,
-      payload: event.payload,
+      payload: {},
       externalEventId: event.externalEventId,
       ttlSeconds: 7 * 24 * 3600,
     }, `Bearer ${accessToken}`);

@@ -47,6 +47,12 @@ async function api(method, path, body) {
     credentials: "same-origin",
   });
   const data = res.headers.get("content-type")?.includes("json") ? await res.json() : null;
+  if (res.status === 401 && state.me) {
+    // Sessions last as long as the Raft access token (1 h); sign in again and
+    // come back to the same document.
+    location.href = `/auth/login?return_to=${encodeURIComponent(`/${location.hash}`)}`;
+    return new Promise(() => {});
+  }
   if (!res.ok) {
     const err = new Error(data?.message ?? data?.error ?? `HTTP ${res.status}`);
     err.status = res.status;

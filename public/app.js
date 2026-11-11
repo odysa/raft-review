@@ -1,7 +1,8 @@
 // Raft Review web client. No build step: plain ES modules + PDF.js from cdnjs.
 
-const PDFJS_VERSION = "4.4.168";
-const PDFJS_BASE = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}`;
+// PDF.js 4.4.168, served by this app (see /vendor/pdfjs) so the CSP allows
+// scripts from this origin only.
+const PDFJS_BASE = "/vendor/pdfjs";
 const PAGE_SEP = "\f";
 
 const state = {
@@ -96,6 +97,53 @@ function clip(text, n) {
   return flat.length > n ? `${flat.slice(0, n - 1)}…` : flat;
 }
 
+const isPdfLike = (d) => d?.kind === "pdf" || d?.kind === "paper";
+
+function modal(title, ...content) {
+  const close = () => wrap.remove();
+  const wrap = h("div", { class: "modal-wrap", onclick: (e) => { if (e.target === wrap) close(); } },
+    h("div", { class: "modal", role: "dialog", "aria-label": title },
+      h("div", { class: "modal-head" }, h("strong", {}, title), h("button", { class: "btn small ghost", onclick: close, "aria-label": "Close" }, "✕")),
+      h("div", { class: "modal-body" }, ...content)));
+  document.addEventListener("keydown", function esc(e) { if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); } });
+  document.body.append(wrap);
+  return wrap;
+}
+
+function diffView(patch) {
+  return h("pre", { class: "diff-view" }, patch.split("\n").map((line) => h("span", {
+    class: line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") ? "meta"
+      : line.startsWith("@@") ? "hunk" : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : "",
+  }, `${line}\n`)));
+}
+
+async function showChanges(doc, from = 1, to = doc.current_version) {
+  const res = await fetch(`/api/documents/${doc.id}/patch?from=${from}&to=${to}`);
+  const patch = await res.text();
+  const pick = (value, onChange) => h("select", { onchange: (e) => onChange(Number(e.target.value)) },
+    doc.versions.slice().reverse().map((v) => h("option", { value: v.version, selected: v.version === value }, `v${v.version} — ${clip(v.note, 40)}`)));
+  const m = modal(`Source changes v${from} → v${to}`,
+    h("div", { class: "row small muted", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px" },
+      "From ", pick(from, (v) => { m.remove(); showChanges(doc, v, Math.max(v, to)); }),
+      " to ", pick(to, (v) => { m.remove(); showChanges(doc, Math.min(from, v), v); }),
+      h("a", { class: "btn small", href: `/api/documents/${doc.id}/patch?from=${from}&to=${to}`, download: `v${from}-v${to}.patch` }, "Download .patch")),
+    h("div", { class: "small muted", style: "margin-bottom:8px" }, "Agents apply this to the paper's repository with ", h("code", {}, "git apply"), " (action get_patch)."),
+    diffView(patch));
+}
+
+async function showFile(doc, path, line) {
+  const { content } = await api("GET", `/api/documents/${doc.id}/file?path=${encodeURIComponent(path)}`);
+  const lines = content.split("\n");
+  const body = h("pre", { class: "file-view" }, lines.map((text, i) => h("span", { class: i + 1 === line ? "hit" : "", dataset: { n: String(i + 1) } }, `${text}\n`)));
+  modal(path, body);
+  body.querySelector(".hit")?.scrollIntoView({ block: "center" });
+}
+
+async function showCompileLog(doc) {
+  const { status, log } = await api("GET", `/api/documents/${doc.id}/compile-log`);
+  modal(`Compile log — v${doc.current_version} (${status})`, h("pre", { class: "file-view" }, log || "(empty)"));
+}
+
 function isHuman() {
   return state.me?.type === "human";
 }
@@ -142,7 +190,7 @@ function pageTextFromContent(content) {
 
 async function extractPdfText(bytes) {
   const lib = await pdfjs();
-  const pdf = await lib.getDocument({ data: bytes.slice() }).promise;
+  const pdf = await lib.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
   const pages = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
@@ -155,8 +203,9 @@ const measureCtx = document.createElement("canvas").getContext("2d");
 
 async function renderPdf(container, doc) {
   const lib = await pdfjs();
-  const bytes = new Uint8Array(await (await fetch(`/api/documents/${doc.id}/raw?version=${doc.current_version}`)).arrayBuffer());
-  const pdf = await lib.getDocument({ data: bytes }).promise;
+  // The URL carries the PDF's hash so a cached copy is never a stale one.
+  const bytes = new Uint8Array(await (await fetch(`/api/documents/${doc.id}/raw?version=${doc.current_version}&h=${encodeURIComponent(pdfKey(doc))}`)).arrayBuffer());
+  const pdf = await lib.getDocument({ data: bytes, isEvalSupported: false }).promise;
   const pagesEl = h("div", { class: "pdf-pages" });
   container.replaceChildren(pagesEl);
   const width = Math.min(container.clientWidth - 48, 900);
@@ -196,10 +245,10 @@ async function renderPdf(container, doc) {
       if (item.hasEOL) layer.append(document.createTextNode("\n"));
     }
     const length = pageTextFromContent(content).length;
-    pages.push({ el, layer, hl, start: offset, length });
+    pages.push({ el, layer, hl, start: offset, length, scale: viewport.scale });
     offset += length + PAGE_SEP.length;
   }
-  state.pdf = { id: doc.id, version: doc.current_version, pages };
+  state.pdf = { id: doc.id, version: doc.current_version, key: pdfKey(doc), pages };
   paintPdfHighlights();
 }
 
@@ -266,7 +315,8 @@ function selectionAnchor() {
   if (!doc) return null;
   let start;
   let end;
-  if (doc.kind === "pdf") {
+  let point = null;
+  if (isPdfLike(doc)) {
     const layerOf = (n) => (n.nodeType === 1 ? n : n.parentElement)?.closest(".pdf-text");
     const la = layerOf(range.startContainer);
     const lb = layerOf(range.endContainer);
@@ -275,6 +325,10 @@ function selectionAnchor() {
     const pb = state.pdf.pages[Number(lb.dataset.page) - 1];
     start = pa.start + textOffset(la, range.startContainer, range.startOffset);
     end = pb.start + textOffset(lb, range.endContainer, range.endOffset);
+    // PDF coordinates (bp from the page's top-left) for SyncTeX.
+    const r0 = range.getClientRects()[0];
+    const box = pa.el.getBoundingClientRect();
+    if (r0) point = { page: Number(la.dataset.page), x: (r0.left - box.left) / pa.scale + 1, y: (r0.top - box.top + r0.height * 0.6) / pa.scale };
   } else {
     const container = document.querySelector(".doc-text");
     if (!container || !container.contains(range.startContainer) || !container.contains(range.endContainer)) return null;
@@ -286,7 +340,7 @@ function selectionAnchor() {
   while (start < end && /\s/.test(text[start])) start++;
   while (end > start && /\s/.test(text[end - 1])) end--;
   if (end <= start) return null;
-  return { start, end, quote: text.slice(start, end), rect: range.getBoundingClientRect() };
+  return { start, end, quote: text.slice(start, end), rect: range.getBoundingClientRect(), point };
 }
 
 // ---------- routing ----------
@@ -361,10 +415,11 @@ async function renderLibrary() {
   state.docs = documents;
   state.agents = agents;
 
-  const fileInput = h("input", { type: "file", accept: ".md,.markdown,.txt,.tex,.latex,.bib,.pdf,text/*,application/pdf", hidden: true });
+  const fileInput = h("input", { type: "file", accept: ".zip,.md,.markdown,.txt,.tex,.latex,.bib,.pdf,text/*,application/pdf,application/zip", hidden: true });
   const reviewer = reviewerSelect(null);
   const drop = h("div", { class: "dropzone" },
-    h("div", {}, "Drop a document here — Markdown, LaTeX, plain text or PDF"),
+    h("div", {}, "Drop a ", h("strong", {}, "LaTeX project (.zip)"), " to review the PDF and edit the source — or a Markdown, text or PDF file"),
+    h("div", { class: "small muted", style: "margin-top:4px" }, "Overleaf: Menu → Download → Source. Git: zip -r paper.zip . -x '.git/*'"),
     h("div", { class: "row" },
       h("button", { class: "btn primary", onclick: () => fileInput.click() }, "Upload document"),
       h("label", { class: "small muted" }, "Reviewer ", reviewer)),
@@ -373,6 +428,15 @@ async function renderLibrary() {
     if (!file) return;
     try {
       const body = { filename: file.name, title: file.name.replace(/\.[^.]+$/, ""), reviewer_agent_id: reviewer.value || undefined };
+      if (/\.zip$/i.test(file.name)) {
+        toast("Uploading project…");
+        const doc = await api("POST", "/api/papers", {
+          filename: file.name, title: body.title, reviewer_agent_id: body.reviewer_agent_id,
+          zip_base64: bytesToBase64(new Uint8Array(await file.arrayBuffer())),
+        });
+        location.hash = `#/doc/${doc.id}`;
+        return;
+      }
       if (/\.pdf$/i.test(file.name)) {
         toast("Reading PDF…");
         const bytes = new Uint8Array(await file.arrayBuffer());
@@ -394,7 +458,7 @@ async function renderLibrary() {
 
   const list = documents.length
     ? h("div", { class: "doc-list" }, documents.map((d) => h("a", { class: "doc-row", href: `#/doc/${d.id}` },
-      h("span", { class: "kind" }, d.kind === "markdown" ? "md" : d.kind === "latex" ? "tex" : d.kind === "pdf" ? "pdf" : "txt"),
+      h("span", { class: "kind" }, d.kind === "markdown" ? "md" : d.kind === "latex" ? "tex" : d.kind === "pdf" ? "pdf" : d.kind === "paper" ? "paper" : "txt"),
       h("div", {}, h("div", { class: "name" }, d.title), h("div", { class: "small muted" }, `${d.filename} · v${d.current_version} · updated ${ago(d.updated_at)}`)),
       h("div", { style: "display:flex;gap:6px;flex-wrap:wrap;justify-content:end" },
         d.pending_suggestions ? h("span", { class: "pill agent" }, `${d.pending_suggestions} suggestion${d.pending_suggestions > 1 ? "s" : ""}`) : null,
@@ -467,14 +531,17 @@ function renderDocument(rebuildPaper = true) {
   let layout = app.querySelector(".review");
   if (!layout || layout.dataset.doc !== doc.id) {
     layout = h("div", { class: "review", dataset: { doc: doc.id } },
-      h("div", { class: `paper ${doc.kind === "pdf" ? "pdf" : ""}` }),
+      h("div", { class: `paper ${isPdfLike(doc) ? "pdf" : ""}` }),
       h("aside", { class: "sidebar" }));
     app.replaceChildren(layout, h("button", { class: "add-comment", onmousedown: (e) => e.preventDefault(), onclick: startComposer }, "💬 Comment"));
     rebuildPaper = true;
   }
   const paper = layout.querySelector(".paper");
-  if (doc.kind === "pdf") {
-    if (rebuildPaper || !state.pdf || state.pdf.id !== doc.id || state.pdf.version !== doc.current_version) {
+  if (doc.kind === "paper" && !doc.paper.compile.pdf_ready) {
+    state.pdf = null;
+    paper.replaceChildren(h("div", { class: "empty" }, compileMessage(doc) ?? "No PDF yet."));
+  } else if (isPdfLike(doc)) {
+    if (rebuildPaper || !state.pdf || state.pdf.id !== doc.id || state.pdf.key !== pdfKey(doc)) {
       paper.replaceChildren(h("div", { class: "muted" }, "Rendering PDF…"));
       renderPdf(paper, doc).catch((err) => paper.replaceChildren(h("div", { class: "empty" }, `PDF failed to render: ${err.message}`)));
     } else {
@@ -486,15 +553,36 @@ function renderDocument(rebuildPaper = true) {
   renderSidebar(layout.querySelector(".sidebar"));
 }
 
+/** Changes whenever a different PDF should be on screen. */
+function pdfKey(doc) {
+  return doc.kind === "paper" ? `p:${doc.paper.compile.pdf_sha}` : String(doc.current_version);
+}
+
+function compileMessage(doc) {
+  const c = doc.paper?.compile;
+  if (!c) return null;
+  const v = `v${doc.current_version}`;
+  if (c.status === "queued" || c.status === "compiling") return `Compiling ${v}…`;
+  if (c.status === "processing") return `Processing the uploaded PDF for ${v}…`;
+  if (c.status === "needs_pdf") return `Waiting for ${doc.reviewer ? `@${doc.reviewer.username}` : "the agent"} to compile ${v} and upload the PDF.`;
+  if (c.status === "failed") return `Compiling ${v} failed.`;
+  return null;
+}
+
 function renderDocTopbar() {
   const doc = state.doc;
   const el = document.getElementById("topbar-doc");
-  const versionInput = h("input", { type: "file", hidden: true, accept: doc.kind === "pdf" ? ".pdf,application/pdf" : ".md,.markdown,.txt,.tex,.latex,.bib,text/*" });
+  const versionInput = h("input", { type: "file", hidden: true, accept: doc.kind === "paper" ? ".zip,application/zip" : doc.kind === "pdf" ? ".pdf,application/pdf" : ".md,.markdown,.txt,.tex,.latex,.bib,text/*" });
   versionInput.addEventListener("change", async () => {
     const file = versionInput.files[0];
     if (!file) return;
     try {
       const body = { note: `Uploaded ${file.name}` };
+      if (doc.kind === "paper") {
+        await api("POST", `/api/documents/${doc.id}/sources`, { ...body, zip_base64: bytesToBase64(new Uint8Array(await file.arrayBuffer())) });
+        toast("New sources uploaded; compiling");
+        return refresh();
+      }
       if (doc.kind === "pdf") {
         const bytes = new Uint8Array(await file.arrayBuffer());
         body.text = await extractPdfText(bytes);
@@ -518,7 +606,13 @@ function renderDocTopbar() {
         refresh();
       }))
       : null,
-    h("a", { class: "btn small", href: `/api/documents/${doc.id}/raw`, download: doc.filename }, "Download"),
+    ...(doc.kind === "paper"
+      ? [
+        h("a", { class: "btn small", href: `/api/documents/${doc.id}/raw`, download: `${doc.title}.pdf` }, "PDF"),
+        h("a", { class: "btn small", href: `/api/documents/${doc.id}/sources.zip` }, "Sources"),
+        doc.current_version > 1 ? h("button", { class: "btn small", onclick: () => showChanges(doc) }, "Changes") : null,
+      ].filter(Boolean)
+      : [h("a", { class: "btn small", href: `/api/documents/${doc.id}/raw`, download: doc.filename }, "Download")]),
     isHuman() ? h("button", { class: "btn small", onclick: () => versionInput.click() }, "New version") : null,
     versionInput,
   );
@@ -575,7 +669,7 @@ function activate(threadId, { scrollSidebar = false, scrollDoc = false } = {}) {
   state.activeThread = threadId;
   document.querySelectorAll(".thread").forEach((el) => el.classList.toggle("active", el.dataset.id === threadId));
   document.querySelectorAll(".doc-text mark").forEach((el) => el.classList.toggle("active", el.dataset.threads.split(" ").includes(threadId)));
-  if (state.doc?.kind === "pdf") paintPdfHighlights();
+  if (isPdfLike(state.doc)) paintPdfHighlights();
   if (scrollSidebar) document.querySelector(`.thread[data-id="${threadId}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   if (scrollDoc) {
     const target = document.querySelector(`.doc-text mark[data-threads~="${threadId}"]`) ?? document.querySelector(".pdf-hl div.active");
@@ -598,11 +692,21 @@ document.addEventListener("selectionchange", () => {
 function startComposer() {
   const anchor = selectionAnchor();
   if (!anchor) return;
-  state.composer = { start: anchor.start, end: anchor.end, quote: anchor.quote };
+  state.composer = { start: anchor.start, end: anchor.end, quote: anchor.quote, point: anchor.point, source: undefined };
   document.querySelector(".add-comment").style.display = "none";
   window.getSelection()?.removeAllRanges();
   renderSidebar(document.querySelector(".sidebar"));
   document.querySelector(".composer textarea")?.focus();
+  if (state.doc.kind === "paper") {
+    // Show where this lands in the LaTeX before the human writes a suggestion.
+    const c = state.composer;
+    api("POST", `/api/documents/${state.doc.id}/map`, { start: c.start, end: c.end, ...(c.point ?? {}) })
+      .then(({ source }) => {
+        if (state.composer !== c) return;
+        c.source = source;
+        renderSidebar(document.querySelector(".sidebar"));
+      }, () => { c.source = null; });
+  }
 }
 
 // ---------- sidebar ----------
@@ -619,6 +723,18 @@ function renderSidebar(sidebar) {
       state.agents.length ? "Pick a reviewer agent in the top bar so it is woken when you comment." : ["No agent connected yet. In Raft, ask one to run ", h("code", {}, `raft integration login --service ${state.serviceKey}`), "."]));
   } else if (doc.reviewer) {
     children.push(h("div", { class: "small muted" }, "Reviewer: ", ...who(doc.reviewer), " — woken in Raft on every comment"));
+  }
+  if (doc.kind === "paper") {
+    const msg = compileMessage(doc);
+    const st = doc.paper.compile.status;
+    if (msg) {
+      children.push(h("div", { class: `banner ${st === "failed" ? "error" : ""}` },
+        st === "queued" || st === "compiling" || st === "processing" ? h("span", { class: "spinner", "aria-hidden": "true" }) : null,
+        msg,
+        st === "failed" ? [" ", h("button", { class: "btn small", onclick: () => showCompileLog(doc) }, "View log"),
+          " ", h("button", { class: "btn small", onclick: () => api("POST", `/api/documents/${doc.id}/compile`).then(refresh, (e) => toast(e.message)) }, "Recompile")] : null,
+        st === "needs_pdf" && doc.paper.compile.pdf_ready ? h("div", { class: "small muted" }, "Showing the previous PDF until then.") : null));
+    }
   }
   if (doc.kind === "pdf") {
     const accepted = doc.threads.flatMap((t) => t.suggestions.filter((s) => s.status === "accepted"));
@@ -649,13 +765,16 @@ function composerCard() {
   const c = state.composer;
   const body = h("textarea", { placeholder: state.doc.reviewer ? `Comment — @${state.doc.reviewer.username} will reply` : "Comment", dataset: { draft: "composer" } });
   const suggestToggle = h("input", { type: "checkbox" });
-  const replacement = h("textarea", { hidden: true, dataset: { draft: "composer-repl" } }, c.quote);
+  const isPaper = state.doc.kind === "paper";
+  const editable = isPaper ? c.source?.quote : c.quote;
+  const replacement = h("textarea", { hidden: true, class: isPaper ? "mono" : "", dataset: { draft: "composer-repl" } }, editable ?? "");
   suggestToggle.addEventListener("change", () => { replacement.hidden = !suggestToggle.checked; if (suggestToggle.checked) replacement.focus(); });
   const submit = async () => {
     if (!body.value.trim()) return body.focus();
     try {
       const res = await api("POST", `/api/documents/${state.doc.id}/threads`, {
         start: c.start, end: c.end, quote: c.quote, body: body.value,
+        ...(c.point ? { x: c.point.x, y: c.point.y } : {}),
         ...(suggestToggle.checked ? { replacement: replacement.value } : {}),
       });
       body.value = "";
@@ -670,8 +789,13 @@ function composerCard() {
   body.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(); });
   return h("div", { class: "composer" },
     h("div", { class: "quote" }, c.quote),
+    isPaper ? h("div", { class: "src-map small" },
+      c.source === undefined ? "Finding it in the LaTeX…"
+        : c.source === null ? "Couldn't match this to the LaTeX source; you can still comment."
+          : ["→ ", h("button", { class: "src-chip", onclick: () => showFile(state.doc, c.source.path, c.source.line) }, `${c.source.path}:${c.source.line}`),
+            h("code", { class: "src-quote" }, c.source.quote)]) : null,
     body,
-    h("label", {}, suggestToggle, "Suggest a replacement"),
+    !isPaper || c.source ? h("label", {}, suggestToggle, isPaper ? "Suggest a LaTeX replacement" : "Suggest a replacement") : null,
     replacement,
     h("div", { class: "row" },
       h("span", { class: "small muted" }, "⌘↵ to send"),
@@ -711,7 +835,10 @@ function threadCard(t) {
     t.status === "open"
       ? h("button", { class: "btn small ghost", title: "Resolve", onclick: () => api("POST", `/api/threads/${t.id}/resolve`).then(refresh) }, "✓ Resolve")
       : t.status === "resolved" ? h("button", { class: "btn small ghost", onclick: () => api("POST", `/api/threads/${t.id}/reopen`).then(refresh) }, "Reopen") : null),
-  h("div", { class: "quote", title: t.anchor.quote }, t.anchor.quote),
+  h("div", { class: "quote", title: t.anchor.quote }, t.anchor.quote || t.source?.quote),
+  t.source ? h("div", { class: "src-map small" },
+    h("button", { class: "src-chip", title: "Open the source file", onclick: () => showFile(doc, t.source.path, t.source.line) }, `${t.source.path}:${t.source.line}`),
+    t.source.quote && t.source.quote !== t.anchor.quote ? h("code", { class: "src-quote" }, t.source.quote) : null) : null,
   mergeTimeline(t).map((item) => item.kind === "comment" ? commentView(item.value) : suggestionView(item.value)),
   t.status !== "orphaned" ? h("div", { class: "reply" }, reply,
     h("div", { class: "row" },
@@ -740,7 +867,9 @@ function suggestionView(s) {
     try {
       await api("POST", `/api/suggestions/${s.id}/${decision}`, {});
       state.preview = null;
-      toast(decision === "accept" ? (state.doc.kind === "pdf" ? "Accepted — added to the source checklist" : "Accepted — document updated") : "Rejected");
+      toast(decision === "accept"
+        ? (state.doc.kind === "paper" ? "Accepted — LaTeX updated, recompiling" : state.doc.kind === "pdf" ? "Accepted — added to the source checklist" : "Accepted — document updated")
+        : "Rejected");
       await refresh();
     } catch (err) { toast(err.message); refresh(); }
   };
@@ -748,7 +877,8 @@ function suggestionView(s) {
     h("div", { class: "s-head" },
       h("span", { style: "display:flex;gap:6px;align-items:center" }, avatar(s.author), h("strong", {}, ...who(s.author)), " suggested"),
       h("span", { class: `status ${s.status}` }, s.status)),
-    h("div", { class: "diff" },
+    s.path ? h("div", { class: "s-path small" }, h("button", { class: "src-chip", onclick: () => showFile(state.doc, s.path, s.line) }, `${s.path}:${s.line ?? "?"}`)) : null,
+    h("div", { class: `diff ${s.path ? "mono" : ""}` },
       s.original ? h("del", {}, s.original) : null,
       s.original && s.replacement ? " " : null,
       s.replacement ? h("ins", {}, s.replacement) : h("span", { class: "muted small" }, " (delete)")),
@@ -757,7 +887,7 @@ function suggestionView(s) {
       h("button", { class: "btn small accept", onclick: () => decide("accept") }, "✓ Accept"),
       h("button", { class: "btn small reject", onclick: () => decide("reject") }, "✕ Reject")) : null,
     s.decided_by ? h("div", { class: "rationale" }, `${s.status} by ${s.decided_by.name} ${ago(s.decided_at)}`) : null);
-  if (pending && state.doc.kind !== "pdf") {
+  if (pending && !isPdfLike(state.doc)) {
     el.addEventListener("mouseenter", () => { state.preview = s.id; renderText(document.querySelector(".paper")); });
     el.addEventListener("mouseleave", () => { state.preview = null; renderText(document.querySelector(".paper")); });
   }

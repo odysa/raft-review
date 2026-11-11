@@ -1,0 +1,18 @@
+% Compiled once at image build so the TeX packages most papers use are in
+% Tectonic's cache; papers then compile without downloading them.
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{graphicx,xcolor,booktabs,multirow,array,tabularx,caption,subcaption,float,wrapfig}
+\usepackage{geometry,microtype,enumitem,url,hyperref,cleveref}
+\usepackage[numbers]{natbib}
+\usepackage{algorithm,algorithmic,listings,tikz,pgfplots}
+\pgfplotsset{compat=1.18}
+\begin{document}
+\section{Warm-up}
+Cache fill: $\sum_i x_i^2$, \cite{x}, \cref{sec:a}. \label{sec:a}
+\begin{table}[h]\centering\begin{tabular}{lr}\toprule a & 1\\\bottomrule\end{tabular}\caption{t}\end{table}
+\begin{tikzpicture}\draw (0,0) -- (1,1);\end{tikzpicture}
+\begin{thebibliography}{1}\bibitem{x} X.\end{thebibliography}
+\end{document}

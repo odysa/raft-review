@@ -6,7 +6,24 @@ import { fileURLToPath } from "node:url";
 
 import { loadConfig, type Config } from "./config.ts";
 import { all, get, openDb, run, type Db, type User } from "./db.ts";
+import { log } from "./log.ts";
+import { createLimiter } from "./ratelimit.ts";
+import { SCHEMA_VERSION } from "./db.ts";
 import { buildManifest } from "./manifest.ts";
+import { createTectonicCompiler, findTectonic, safeProjectPath, type Compiler, type ProjectFile } from "./compile.ts";
+import {
+  addPaperSources,
+  createPaper,
+  ingestPdf,
+  loadProject,
+  mapPdfToSource,
+  paperPatch,
+  readTextFile,
+  setCompileStatus,
+  versionFiles,
+} from "./paper.ts";
+import { isTextPath, unzipProject, ZipError, zipProject } from "./zip.ts";
+import { lineOf, pageOf } from "./anchor.ts";
 import { createRaftNotifier, recentAgentEvents, type Notifier, type NotifyReason } from "./notify.ts";
 import { newPkce, RaftClient, RaftError, type RaftUserinfo } from "./raft.ts";
 import { handleWebhook, SUBSCRIBED_EVENTS, verifyWebhook, WebhookError } from "./webhooks.ts";
@@ -33,6 +50,24 @@ import {
 } from "./review.ts";
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../public");
+const PDFJS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/pdfjs-dist/build");
+const VERSION = JSON.parse(fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8")).version as string;
+
+// Strict CSP: scripts only from this origin (PDF.js is served locally), no
+// eval, no framing. Inline styles are allowed for PDF.js's text layer.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "worker-src 'self'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
 const SESSION_COOKIE = "rr_session";
 const LOGIN_STATE_COOKIE = "rr_login";
 // Raft access tokens last an hour and there is no refresh token, so an app
@@ -40,7 +75,8 @@ const LOGIN_STATE_COOKIE = "rr_login";
 const MAX_SESSION_SECONDS = 3600;
 const DEV_SESSION_SECONDS = 7 * 24 * 3600;
 const STATE_TTL_MS = 10 * 60 * 1000;
-const MAX_JSON_BYTES = 40 * 1024 * 1024;
+// A 50 MB project zip is ~67 MB as base64.
+const MAX_JSON_BYTES = 80 * 1024 * 1024;
 
 type Req = http.IncomingMessage;
 type Res = http.ServerResponse;
@@ -125,12 +161,15 @@ const CONTENT_TYPES: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".svg": "image/svg+xml",
   ".md": "text/markdown; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
 };
 
 export interface AppDeps {
   db?: Db;
   fetchImpl?: typeof fetch;
   notifier?: Notifier;
+  /** Override the LaTeX compiler (tests); null disables compiling. */
+  compiler?: Compiler | null;
 }
 
 export function createApp(config: Config, deps: AppDeps = {}) {
@@ -141,6 +180,21 @@ export function createApp(config: Config, deps: AppDeps = {}) {
   }
   const raft = new RaftClient(config, deps.fetchImpl, raftServerHint);
   const notifier = deps.notifier ?? createRaftNotifier(db, config, raft);
+  const compiler: Compiler | null = deps.compiler !== undefined ? deps.compiler : (() => {
+    if (config.compiler === "none") return null;
+    const binary = findTectonic(config.tectonicPath);
+    if (!binary) {
+      if (config.compiler === "tectonic") throw new Error("COMPILER=tectonic but no tectonic binary was found (set TECTONIC_PATH)");
+      return null;
+    }
+    return createTectonicCompiler({
+      binary,
+      timeoutMs: config.compileTimeoutMs,
+      concurrency: config.compileConcurrency,
+      onlyCached: config.tectonicOnlyCached,
+    });
+  })();
+  const pendingCompiles = new Set<Promise<unknown>>();
   const secureCookies = config.publicUrl.startsWith("https://");
   const membershipTtlMs = config.membershipTtlMs ?? 60_000;
   const pendingNotifications = new Set<Promise<unknown>>();
@@ -256,10 +310,10 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     const serverId = config.raftServerId || raftServerHint();
     if (!serverId) return; // retried after the first human sign-in
     subscribed = raft.subscribe(serverId, SUBSCRIBED_EVENTS).then((r) => {
-      console.log(`[raft-review] App Notifications: ${r.detail}`);
+      log(r.ok ? "info" : "warn", "app_notifications_subscribe", { ok: r.ok, detail: r.detail });
       if (!r.ok) subscribed = null;
     }, (err) => {
-      console.error("[raft-review] App Notifications subscribe failed", (err as Error).message);
+      log("warn", "app_notifications_subscribe", { ok: false, detail: (err as Error).message });
       subscribed = null;
     });
   }
@@ -291,7 +345,22 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     json(res, 200, buildManifest(config));
   });
 
-  route("GET", "/healthz", ({ res }) => json(res, 200, { ok: true }));
+  route("GET", "/healthz", ({ res }) => {
+    try {
+      get(db, "SELECT 1 AS ok");
+      json(res, 200, { ok: true, version: VERSION, schema: SCHEMA_VERSION, compiler: compiler?.name ?? "none" });
+    } catch (err) {
+      json(res, 503, { ok: false, error: (err as Error).message });
+    }
+  });
+
+  // PDF.js, served from this origin so the CSP needs no CDN.
+  route("GET", "/vendor/pdfjs/:file", ({ res, params }) => {
+    if (params.file !== "pdf.min.mjs" && params.file !== "pdf.worker.min.mjs") return json(res, 404, { error: "not_found" });
+    const file = path.join(PDFJS_DIR, params.file);
+    res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "public, max-age=604800, immutable", "x-content-type-options": "nosniff" });
+    fs.createReadStream(file).pipe(res);
+  });
 
   // Human sign-in: PKCE + state, then Raft's consent screen.
   route("GET", "/auth/login", ({ res, url }) => {
@@ -529,10 +598,11 @@ export function createApp(config: Config, deps: AppDeps = {}) {
   for (const decision of ["accept", "reject"] as const) {
     route("POST", `/api/suggestions/:suggestion_id/${decision}`, (ctx) => {
       const user = requireHuman(ctx);
-      const { suggestion, document } = decideSuggestion(db, user, ctx.params.suggestion_id, decision);
+      const { suggestion, document, compileVersion } = decideSuggestion(db, user, ctx.params.suggestion_id, decision, { compilerAvailable: Boolean(compiler) });
       broadcast(document.id, decision);
       const author = getUser(db, suggestion.author_id);
-      if (author?.type === "agent") {
+      if (compileVersion) schedulePdf(document.id, compileVersion, user);
+      if (author?.type === "agent" && !(compileVersion && !compiler)) {
         notifyAgent({
           threadId: suggestion.thread_id, documentId: document.id, actor: user,
           reason: decision === "accept" ? "suggestion_accepted" : "suggestion_rejected",
@@ -542,6 +612,222 @@ export function createApp(config: Config, deps: AppDeps = {}) {
       json(ctx.res, 200, { suggestion: { id: suggestion.id, status: suggestion.status }, document: documentView(db, user, document.id) });
     });
   }
+
+  // ---------- papers (LaTeX projects) ----------
+
+  /** Compile a version (or ask the agent for a PDF when there's no compiler). */
+  function schedulePdf(documentId: string, version: number, actor: User | null): void {
+    const doc = get<{ reviewer_agent_id: string | null }>(db, "SELECT reviewer_agent_id FROM documents WHERE id = ?", documentId);
+    if (!compiler) {
+      setCompileStatus(db, documentId, version, "needs_pdf");
+      broadcast(documentId, "compile");
+      if (actor && doc?.reviewer_agent_id) {
+        notifyAgent({ threadId: null, documentId, actor, reason: "pdf_needed", agentId: doc.reviewer_agent_id, dedupeKey: `pdf:${documentId}:${version}` });
+      }
+      return;
+    }
+    setCompileStatus(db, documentId, version, "compiling");
+    broadcast(documentId, "compile");
+    const job = (async () => {
+      const main = get<{ main_path: string }>(db, "SELECT main_path FROM documents WHERE id = ?", documentId)?.main_path;
+      if (!main) return;
+      const result = await compiler.compile(loadProject(db, documentId, version), main);
+      log("info", "compile", { document: documentId, version, ok: result.ok, ms: result.ms });
+      if (result.ok && result.pdf) {
+        await ingestPdf(db, documentId, version, result.pdf, result.synctex ?? null, result.log);
+      } else {
+        setCompileStatus(db, documentId, version, "failed", result.log);
+        if (actor && doc?.reviewer_agent_id) {
+          notifyAgent({ threadId: null, documentId, actor, reason: "compile_failed", agentId: doc.reviewer_agent_id, dedupeKey: `compile:${documentId}:${version}` });
+        }
+      }
+      broadcast(documentId, "compile");
+    })().catch((err) => {
+      log("error", "compile_crashed", { document: documentId, version, error: (err as Error).message });
+      setCompileStatus(db, documentId, version, "failed", `Internal error while compiling: ${(err as Error).message}`);
+      broadcast(documentId, "compile");
+    });
+    pendingCompiles.add(job);
+    job.finally(() => pendingCompiles.delete(job));
+  }
+
+  /** Project files from a request: a zip (base64) or explicit files. */
+  function projectFromBody(body: Record<string, any>): ProjectFile[] {
+    if (typeof body.zip_base64 === "string" && body.zip_base64) {
+      try {
+        return unzipProject(new Uint8Array(Buffer.from(body.zip_base64, "base64")));
+      } catch (err) {
+        throw new HttpError(400, "bad_zip", (err as Error).message);
+      }
+    }
+    const files = typeof body.files === "string" ? (() => { try { return JSON.parse(body.files); } catch { return null; } })() : body.files;
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new HttpError(400, "invalid_request", "send zip_base64 (a .zip of the LaTeX project) or files: [{path, content}]");
+    }
+    return files.map((f: any) => {
+      const p = typeof f?.path === "string" ? safeProjectPath(f.path) : null;
+      if (!p) throw new HttpError(400, "bad_path", `invalid file path ${JSON.stringify(f?.path)}`);
+      if (typeof f.content === "string") return { path: p, data: new TextEncoder().encode(f.content) };
+      if (typeof f.content_base64 === "string") return { path: p, data: new Uint8Array(Buffer.from(f.content_base64, "base64")) };
+      throw new HttpError(400, "invalid_request", `file ${p} needs content or content_base64`);
+    });
+  }
+
+  function requirePaper(user: User, documentId: string) {
+    const view = documentView(db, user, documentId, { includeText: false });
+    if (view.kind !== "paper") throw new HttpError(400, "not_a_paper", "this document is not a LaTeX project");
+    return view;
+  }
+
+  async function pdfFromBody(body: Record<string, any>, documentId: string, version: number): Promise<boolean> {
+    if (typeof body.pdf_base64 !== "string" || !body.pdf_base64) return false;
+    const pdf = new Uint8Array(Buffer.from(body.pdf_base64, "base64"));
+    const synctex = typeof body.synctex_base64 === "string" && body.synctex_base64 ? new Uint8Array(Buffer.from(body.synctex_base64, "base64")) : null;
+    await ingestPdf(db, documentId, version, pdf, synctex, "PDF uploaded by the agent");
+    return true;
+  }
+
+  route("POST", "/api/papers", async (ctx) => {
+    const user = requireUser(ctx);
+    const body = await readJson(ctx.req);
+    const files = projectFromBody(body);
+    const hasPdf = typeof body.pdf_base64 === "string" && body.pdf_base64.length > 0;
+    const doc = createPaper(db, user, {
+      title: body.title, filename: body.filename, files, mainPath: body.main_path,
+      reviewerAgentId: body.reviewer_agent_id, hasPdf, compilerAvailable: Boolean(compiler),
+    });
+    if (hasPdf) {
+      try {
+        await pdfFromBody(body, doc.id, 1);
+      } catch (err) {
+        setCompileStatus(db, doc.id, 1, "failed", (err as Error).message);
+      }
+    } else {
+      schedulePdf(doc.id, 1, user);
+    }
+    if (doc.reviewer_agent_id && user.type === "human") {
+      notifyAgent({ threadId: null, documentId: doc.id, actor: user, reason: "review_requested", agentId: doc.reviewer_agent_id, dedupeKey: `review:${doc.id}:${doc.reviewer_agent_id}` });
+    }
+    json(ctx.res, 201, { ...documentView(db, user, doc.id, { includeText: false }), document_url: docUrl(doc.id) });
+  });
+
+  route("POST", "/api/documents/:document_id/sources", async (ctx) => {
+    const user = requireUser(ctx);
+    const body = await readJson(ctx.req);
+    requirePaper(user, ctx.params.document_id);
+    const files = projectFromBody(body);
+    const hasPdf = typeof body.pdf_base64 === "string" && body.pdf_base64.length > 0;
+    const { doc, version } = addPaperSources(db, user, ctx.params.document_id, {
+      files, mainPath: body.main_path, note: body.note, hasPdf, compilerAvailable: Boolean(compiler),
+    });
+    if (hasPdf) await pdfFromBody(body, doc.id, version);
+    else schedulePdf(doc.id, version, user.type === "human" ? user : null);
+    broadcast(doc.id, "version");
+    json(ctx.res, 201, { ...documentView(db, user, doc.id, { includeText: false }), document_url: docUrl(doc.id) });
+  });
+
+  route("POST", "/api/documents/:document_id/pdf", async (ctx) => {
+    const user = requireUser(ctx);
+    const body = await readJson(ctx.req);
+    const view = requirePaper(user, ctx.params.document_id);
+    const version = Number(body.version ?? view.current_version);
+    if (version !== view.current_version) throw new HttpError(409, "stale_version", `the current version is v${view.current_version}; compile that one`);
+    if (!(await pdfFromBody(body, view.id, version))) throw new HttpError(400, "invalid_request", "pdf_base64 is required");
+    broadcast(view.id, "compile");
+    json(ctx.res, 200, documentView(db, user, view.id, { includeText: false }));
+  });
+
+  route("POST", "/api/documents/:document_id/compile", (ctx) => {
+    const user = requireUser(ctx);
+    const view = requirePaper(user, ctx.params.document_id);
+    if (!compiler) throw new HttpError(409, "no_compiler", "this server has no LaTeX compiler; the agent uploads PDFs with upload_pdf");
+    schedulePdf(view.id, view.current_version, user);
+    json(ctx.res, 202, { status: "compiling", version: view.current_version });
+  });
+
+  route("GET", "/api/documents/:document_id/compile-log", (ctx) => {
+    const user = requireUser(ctx);
+    const view = requirePaper(user, ctx.params.document_id);
+    const version = Number(ctx.url.searchParams.get("version") ?? view.current_version);
+    const row = get<{ compile_status: string; compile_log: string }>(db, "SELECT compile_status, compile_log FROM versions WHERE document_id = ? AND version = ?", view.id, version);
+    if (!row) throw new HttpError(404, "not_found", "version not found");
+    json(ctx.res, 200, { version, status: row.compile_status, log: row.compile_log });
+  });
+
+  route("GET", "/api/documents/:document_id/files", (ctx) => {
+    const user = requireUser(ctx);
+    const view = requirePaper(user, ctx.params.document_id);
+    const version = Number(ctx.url.searchParams.get("version") ?? view.current_version);
+    json(ctx.res, 200, {
+      version,
+      main_path: view.paper?.main_path,
+      files: versionFiles(db, view.id, version).map((f) => ({ path: f.path, size: f.size, text: isTextPath(f.path) })),
+    });
+  });
+
+  route("GET", "/api/documents/:document_id/file", (ctx) => {
+    const user = requireUser(ctx);
+    const view = requirePaper(user, ctx.params.document_id);
+    const version = Number(ctx.url.searchParams.get("version") ?? view.current_version);
+    const p = ctx.url.searchParams.get("path") ?? "";
+    const content = readTextFile(db, view.id, version, p);
+    if (content === null || !isTextPath(p)) throw new HttpError(404, "file_not_found", `no text file ${p} in v${version}`);
+    const threads = view.threads.filter((t) => t.source?.path === p).map((t) => ({ thread_id: t.id, line: t.source?.line, quote: t.source?.quote, status: t.status }));
+    json(ctx.res, 200, { path: p, version, content, threads });
+  });
+
+  route("GET", "/api/documents/:document_id/patch", (ctx) => {
+    const user = requireUser(ctx);
+    const view = requirePaper(user, ctx.params.document_id);
+    const to = Number(ctx.url.searchParams.get("to") ?? view.current_version);
+    const from = Number(ctx.url.searchParams.get("from") ?? ctx.url.searchParams.get("since_version") ?? 1);
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to > view.current_version || from > to) {
+      throw new HttpError(400, "invalid_range", `versions must satisfy 1 <= from <= to <= ${view.current_version}`);
+    }
+    const patch = paperPatch(db, view.id, from, to);
+    ctx.res.writeHead(200, {
+      "content-type": "text/x-diff; charset=utf-8",
+      "content-disposition": `inline; filename="${view.id}-v${from}-v${to}.patch"`,
+      "x-content-type-options": "nosniff",
+      "cache-control": "no-store",
+    });
+    ctx.res.end(patch || `# no source changes between v${from} and v${to}\n`);
+  });
+
+  route("GET", "/api/documents/:document_id/sources.zip", (ctx) => {
+    const user = requireUser(ctx);
+    const view = requirePaper(user, ctx.params.document_id);
+    const version = Number(ctx.url.searchParams.get("version") ?? view.current_version);
+    const zip = zipProject(loadProject(db, view.id, version));
+    const name = `${view.title.replace(/[^\w.-]+/g, "-").slice(0, 60) || "paper"}-v${version}.zip`;
+    ctx.res.writeHead(200, {
+      "content-type": "application/zip",
+      "content-disposition": `attachment; filename="${name}"`,
+      "x-content-type-options": "nosniff",
+    });
+    ctx.res.end(Buffer.from(zip));
+  });
+
+  /** Preview where a PDF selection lands in the LaTeX, for the comment box. */
+  route("POST", "/api/documents/:document_id/map", async (ctx) => {
+    const user = requireUser(ctx);
+    const body = await readJson(ctx.req);
+    requirePaper(user, ctx.params.document_id);
+    const doc = get<import("./db.ts").DocumentRow>(db, "SELECT * FROM documents WHERE id = ?", ctx.params.document_id)!;
+    const version = get<import("./db.ts").VersionRow>(db, "SELECT * FROM versions WHERE document_id = ? AND version = ?", doc.id, doc.current_version)!;
+    const start = Number(body.start);
+    const end = Number(body.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start || end > version.text.length) {
+      throw new HttpError(400, "invalid_anchor", "start/end must select text in the current PDF");
+    }
+    const src = mapPdfToSource(db, doc, version, {
+      quote: version.text.slice(start, end), page: pageOf(version.text, start),
+      x: typeof body.x === "number" ? body.x : undefined, y: typeof body.y === "number" ? body.y : undefined,
+    });
+    if (!src) return json(ctx.res, 200, { source: null });
+    const content = readTextFile(db, doc.id, version.version, src.path)!;
+    json(ctx.res, 200, { source: { path: src.path, line: lineOf(content, src.start), quote: src.quote, method: src.method } });
+  });
 
   route("GET", "/api/inbox", (ctx) => {
     const user = requireUser(ctx);
@@ -610,13 +896,40 @@ export function createApp(config: Config, deps: AppDeps = {}) {
     fs.createReadStream(resolved).pipe(res);
   }
 
+  const authLimiter = createLimiter({ capacity: 20, perMinute: 20 });
+  const writeLimiter = createLimiter({ capacity: 120, perMinute: 120 });
+  const heavyLimiter = createLimiter({ capacity: 10, perMinute: 6 });
+  function clientKey(req: Req): string {
+    const fwd = config.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
+    return fwd || req.socket.remoteAddress || "unknown";
+  }
+  function limit(req: Req, pathname: string): void {
+    if (req.method === "GET" || req.method === "HEAD" || pathname === "/webhooks/raft") return;
+    const key = clientKey(req);
+    const check = (limiter: ReturnType<typeof createLimiter>, bucket: string) => {
+      if (!limiter.take(`${bucket}:${key}`)) {
+        throw new HttpError(429, "rate_limited", `too many requests; retry in ${limiter.retryAfterSeconds(`${bucket}:${key}`)} s`);
+      }
+    };
+    if (pathname.startsWith("/auth/")) check(authLimiter, "auth");
+    else check(writeLimiter, "write");
+    if (pathname === "/api/papers" || /\/(sources|compile|pdf)$/.test(pathname)) check(heavyLimiter, "heavy");
+  }
+
   async function handle(req: Req, res: Res): Promise<void> {
     const url = new URL(req.url ?? "/", config.publicUrl);
-    // No framing (clickjacking on Accept buttons) and no URL leakage via Referer.
+    const started = Date.now();
+    res.setHeader("content-security-policy", CSP);
     res.setHeader("x-frame-options", "DENY");
-    res.setHeader("content-security-policy", "frame-ancestors 'none'");
     res.setHeader("referrer-policy", "same-origin");
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("cross-origin-opener-policy", "same-origin");
+    if (secureCookies) res.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
+    if (url.pathname !== "/healthz" && !url.pathname.endsWith("/events")) {
+      res.on("finish", () => log("info", "request", { method: req.method, path: url.pathname, status: res.statusCode, ms: Date.now() - started }));
+    }
     try {
+      limit(req, url.pathname);
       // Reject cross-origin state changes outright (defense in depth on top
       // of SameSite=Lax and the JSON-only body rule).
       const origin = req.headers.origin;
@@ -658,7 +971,7 @@ export function createApp(config: Config, deps: AppDeps = {}) {
         }
         json(res, 502, { error: "raft_exchange_failed", hint: `${err.message}: ${String(upstream).slice(0, 200)}` });
       } else {
-        console.error("[raft-review] unexpected error", err);
+        log("error", "unhandled", { method: req.method, path: url.pathname, error: (err as Error)?.stack ?? String(err) });
         json(res, 500, { error: "internal_error" });
       }
     }
@@ -667,8 +980,20 @@ export function createApp(config: Config, deps: AppDeps = {}) {
   return {
     db,
     handle,
+    compilerName: compiler?.name ?? "none",
+    /** Graceful shutdown: end live streams, let running compiles finish. */
+    async close(timeoutMs = 30_000): Promise<void> {
+      for (const set of listeners.values()) for (const r of set) r.end();
+      listeners.clear();
+      await Promise.race([
+        Promise.all([...pendingCompiles, ...pendingNotifications]),
+        new Promise((r) => setTimeout(r, timeoutMs)),
+      ]);
+      db.close();
+    },
     /** Test hook: wait for fire-and-forget agent notifications. */
     async settle(): Promise<void> {
+      await Promise.all([...pendingCompiles]);
       await Promise.all([...pendingNotifications]);
     },
   };
@@ -677,7 +1002,28 @@ export function createApp(config: Config, deps: AppDeps = {}) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const config = loadConfig();
   const app = createApp(config);
-  http.createServer((req, res) => void app.handle(req, res)).listen(config.port, () => {
-    console.log(`raft-review listening on ${config.publicUrl} (port ${config.port})${config.devLogin ? " [dev login enabled]" : ""}`);
+  const server = http.createServer((req, res) => void app.handle(req, res));
+  server.requestTimeout = 5 * 60_000; // large uploads
+  server.headersTimeout = 60_000;
+  server.listen(config.port, () => {
+    log("info", "listening", {
+      version: VERSION, public_url: config.publicUrl, port: config.port, compiler: app.compilerName,
+      dev_login: config.devLogin, webhooks: config.webhookSecrets.length > 0, data_dir: config.dataDir,
+    });
+    if (!config.devLogin && !config.publicUrl.startsWith("https://")) {
+      log("warn", "insecure_public_url", { hint: "PUBLIC_URL should be https in production; cookies are not marked Secure" });
+    }
   });
+  let stopping = false;
+  const stop = (signal: string) => {
+    if (stopping) return;
+    stopping = true;
+    log("info", "shutting_down", { signal });
+    server.close();
+    server.closeIdleConnections();
+    app.close().then(() => process.exit(0), () => process.exit(1));
+    setTimeout(() => process.exit(1), 40_000).unref();
+  };
+  process.on("SIGTERM", () => stop("SIGTERM"));
+  process.on("SIGINT", () => stop("SIGINT"));
 }

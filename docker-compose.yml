@@ -1,0 +1,16 @@
+# docker compose up -d   (copy .env.example to .env first)
+services:
+  raft-review:
+    build: .
+    image: raft-review:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      TRUST_PROXY: "1"        # behind the reverse proxy below
+    volumes:
+      - raft-review-data:/data
+    ports:
+      - "127.0.0.1:8787:8787" # put a TLS reverse proxy (Caddy, nginx) in front
+volumes:
+  raft-review-data:

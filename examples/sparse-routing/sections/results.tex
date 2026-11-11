@@ -1,0 +1,19 @@
+\section{Results}
+Table~\ref{tab:main} compares Sparse Routing with dense attention.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lrr}
+    \toprule
+    Model & PG-19 ppl & Speed \\
+    \midrule
+    Dense & 18.2 & 1.0$\times$ \\
+    Sparse Routing & 18.0 & 3.1$\times$ \\
+    \bottomrule
+  \end{tabular}
+  \caption{Perplexity and relative speed at 32k tokens.}
+  \label{tab:main}
+\end{table}
+
+Sparse Routing matches dense perplexity while running three times faster, and
+it is clearly the best long-context method available today.

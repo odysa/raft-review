@@ -3,7 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export type PrincipalType = "human" | "agent";
-export type DocKind = "text" | "markdown" | "latex" | "pdf";
+export type DocKind = "text" | "markdown" | "latex" | "pdf" | "paper";
 
 export interface User {
   id: string;
@@ -23,6 +23,8 @@ export interface DocumentRow {
   created_by: string;
   reviewer_agent_id: string | null;
   current_version: number;
+  /** Paper projects: the root .tex file. */
+  main_path: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -35,6 +37,11 @@ export interface VersionRow {
   created_by: string;
   note: string;
   created_at: number;
+  synctex: Uint8Array | null;
+  /** Papers: "" (n/a) | queued | compiling | ok | failed | needs_pdf */
+  compile_status: string;
+  compile_log: string;
+  pdf_sha: string | null;
 }
 
 export type ThreadStatus = "open" | "resolved" | "orphaned";
@@ -49,6 +56,14 @@ export interface ThreadRow {
   suffix: string;
   /** "" | "fuzzy" | "context": set when a new version edited the passage. */
   reanchored: string;
+  /** Papers: where the PDF selection lives in the LaTeX source. */
+  src_path: string | null;
+  src_start: number | null;
+  src_end: number | null;
+  src_quote: string | null;
+  src_prefix: string | null;
+  src_suffix: string | null;
+  src_method: string | null;
   status: ThreadStatus;
   created_by: string;
   created_at: number;
@@ -74,6 +89,8 @@ export interface SuggestionRow {
   original: string;
   replacement: string;
   rationale: string;
+  /** Papers: the source file this suggestion edits. */
+  path: string | null;
   status: SuggestionStatus;
   decided_by: string | null;
   decided_at: number | null;
@@ -201,7 +218,7 @@ export function openDb(dataDir: string): Db {
   return db;
 }
 
-// Columns added after the first release; ALTER is a no-op error when present.
+// Columns added after the first release, before versioned migrations.
 const ADDITIVE_COLUMNS: Array<[string, string]> = [
   ["sessions", "access_token TEXT"],
   ["sessions", "verified_at INTEGER NOT NULL DEFAULT 0"],
@@ -210,13 +227,63 @@ const ADDITIVE_COLUMNS: Array<[string, string]> = [
   ["threads", "reanchored TEXT NOT NULL DEFAULT ''"],
 ];
 
+/** Versioned migrations, tracked in PRAGMA user_version. Append only. */
+const MIGRATIONS: Array<{ version: number; sql: string }> = [
+  {
+    version: 2,
+    sql: `
+      CREATE TABLE IF NOT EXISTS blobs (
+        sha256 TEXT PRIMARY KEY,
+        data BLOB NOT NULL,
+        size INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS paper_files (
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        sha256 TEXT NOT NULL REFERENCES blobs(sha256),
+        PRIMARY KEY (document_id, version, path)
+      );
+      ALTER TABLE documents ADD COLUMN main_path TEXT;
+      ALTER TABLE versions ADD COLUMN synctex BLOB;
+      ALTER TABLE versions ADD COLUMN compile_status TEXT NOT NULL DEFAULT '';
+      ALTER TABLE versions ADD COLUMN compile_log TEXT NOT NULL DEFAULT '';
+      ALTER TABLE versions ADD COLUMN pdf_sha TEXT;
+      ALTER TABLE threads ADD COLUMN src_path TEXT;
+      ALTER TABLE threads ADD COLUMN src_start INTEGER;
+      ALTER TABLE threads ADD COLUMN src_end INTEGER;
+      ALTER TABLE threads ADD COLUMN src_quote TEXT;
+      ALTER TABLE threads ADD COLUMN src_prefix TEXT;
+      ALTER TABLE threads ADD COLUMN src_suffix TEXT;
+      ALTER TABLE threads ADD COLUMN src_method TEXT;
+      ALTER TABLE suggestions ADD COLUMN path TEXT;
+    `,
+  },
+];
+
+export const SCHEMA_VERSION = MIGRATIONS.at(-1)!.version;
+
 function init(db: DatabaseSync): void {
   db.exec("PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(SCHEMA);
   for (const [table, column] of ADDITIVE_COLUMNS) {
     const name = column.split(" ")[0];
     const existing = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     if (!existing.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`);
+  }
+  let current = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+  if (current < 1) {
+    db.exec("PRAGMA user_version = 1");
+    current = 1;
+  }
+  for (const m of MIGRATIONS) {
+    if (m.version <= current) continue;
+    tx(db, () => {
+      db.exec(m.sql);
+      db.exec(`PRAGMA user_version = ${m.version}`);
+    });
+    current = m.version;
   }
 }
 

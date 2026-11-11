@@ -209,3 +209,32 @@ textarea:focus, input:focus, select:focus { outline: 2px solid color-mix(in srgb
   .topbar { padding: 10px 16px; flex-wrap: wrap; }
   .topbar-doc { order: 3; flex-basis: 100%; flex-wrap: wrap; }
 }
+
+/* papers */
+.src-map { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; margin: -2px 0 6px; color: var(--muted); }
+.src-chip {
+  font: 600 11.5px var(--mono); color: var(--agent); background: var(--agent-soft); border: 0; border-radius: 6px;
+  padding: 2px 6px; cursor: pointer;
+}
+.src-chip:hover { text-decoration: underline; }
+.src-quote { font: 12px/1.45 var(--mono); background: var(--surface-2); padding: 2px 5px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; color: var(--text); max-height: 4.5em; overflow: hidden; }
+.s-path { padding: 6px 8px 0; }
+.diff.mono, textarea.mono { font: 12.5px/1.55 var(--mono); }
+.banner.error { background: var(--del-bg); color: var(--text); }
+.banner .btn { margin-top: 4px; }
+.spinner { display: inline-block; width: 11px; height: 11px; margin-right: 6px; border: 2px solid var(--agent); border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+
+.modal-wrap { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.35); display: grid; place-items: center; padding: 16px; }
+.modal { background: var(--surface); color: var(--text); border-radius: 12px; box-shadow: var(--shadow); width: min(980px, 100%); max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.modal-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.modal-body { padding: 14px 16px; overflow: auto; }
+.diff-view, .file-view { margin: 0; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; }
+.diff-view .add { background: var(--ins-bg); color: var(--ins); display: block; }
+.diff-view .del { background: var(--del-bg); color: var(--del); display: block; }
+.diff-view .hunk { color: var(--agent); display: block; }
+.diff-view .meta { color: var(--muted); font-weight: 700; display: block; }
+.file-view span { display: block; padding-left: 4.2em; text-indent: -4.2em; }
+.file-view span::before { content: attr(data-n); display: inline-block; width: 3.4em; margin-right: .8em; text-align: right; color: var(--muted); }
+.file-view span.hit { background: var(--accent-soft); }

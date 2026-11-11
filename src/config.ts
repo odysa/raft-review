@@ -19,6 +19,16 @@ export interface Config {
   membershipTtlMs?: number;
   /** App Notifications signing secrets (current first; previous during rotation). */
   webhookSecrets: string[];
+  /** LaTeX compiler: "auto" (Tectonic if installed), "tectonic", or "none"
+   *  (agents compile and upload PDFs). */
+  compiler: "auto" | "tectonic" | "none";
+  tectonicPath?: string;
+  compileTimeoutMs: number;
+  compileConcurrency: number;
+  /** Tectonic: use only locally cached TeX packages (no network). */
+  tectonicOnlyCached: boolean;
+  /** Behind a reverse proxy: take the client IP from X-Forwarded-For. */
+  trustProxy?: boolean;
 }
 
 function trimSlash(value: string): string {
@@ -40,6 +50,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     devLogin,
     serviceKey: env.RAFT_SERVICE_KEY ?? env.RAFT_CLIENT_ID ?? "raft-review",
     webhookSecrets: (env.RAFT_WEBHOOK_SECRET ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+    compiler: env.COMPILER === "none" || env.COMPILER === "tectonic" ? env.COMPILER : "auto",
+    tectonicPath: env.TECTONIC_PATH || undefined,
+    compileTimeoutMs: Number(env.COMPILE_TIMEOUT_MS ?? 120_000),
+    compileConcurrency: Number(env.COMPILE_CONCURRENCY ?? 2),
+    tectonicOnlyCached: env.TECTONIC_ONLY_CACHED === "1",
+    trustProxy: env.TRUST_PROXY === "1",
   };
   if (!devLogin && (!config.clientId || !config.clientSecret)) {
     throw new Error("RAFT_CLIENT_ID and RAFT_CLIENT_SECRET are required (or set RAFT_REVIEW_DEV_LOGIN=1 for local development)");

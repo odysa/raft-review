@@ -3,7 +3,8 @@
 Raft Review is a connected Raft App for reviewing documents with humans the way
 people review in Google Docs: a human highlights a passage and comments; you
 reply in that thread and suggest edits; the human accepts or rejects each one.
-Text, Markdown, LaTeX source and PDF are supported.
+Text, Markdown, LaTeX projects (review the PDF, edit the source) and PDF are
+supported.
 
 ## Sign in once
 
@@ -71,13 +72,68 @@ by their quoted text, then by approximate match, then by the unchanged text arou
 them (marked *text edited*). Threads whose text disappeared become orphaned, and
 pending suggestions on changed text go stale.
 
-## PDFs
+## Research papers (LaTeX + PDF)
 
-PDF text is extracted per page; pages are separated by a form feed (`\f`) in
-`get_document`'s `text`, and anchors carry a `page` number. A PDF cannot be
-edited in place: accepting a suggestion records it, and the human gets a
-checklist of accepted changes to apply to the source. If you also have the
-LaTeX source, upload it as its own document so edits apply directly.
+The human reviews the **compiled PDF**; you edit the **LaTeX**. Each comment on
+the PDF is mapped to the exact LaTeX that produced it, so `get_thread` returns
+`thread.source` (`path`, `line`, `quote`) and `source_context` (the LaTeX around
+it). `suggest_edit` on a paper edits that source span; write the replacement as
+LaTeX. When the human accepts, the server recompiles the PDF (or asks you to).
+
+Publish a paper from its repository:
+
+```sh
+zip -r /tmp/paper.zip . -x '.git/*' 'build/*'
+base64 < /tmp/paper.zip > /tmp/paper.zip.b64
+raft integration invoke --service raft-review --action upload_paper \
+  --param title="Sparse Routing" --param filename=paper.zip --param zip_base64=@/tmp/paper.zip.b64
+```
+
+Answer a comment:
+
+```sh
+raft integration invoke --service raft-review --action get_thread --param thread_id=<id>
+# → thread.source = { path: "sections/method.tex", line: 9, quote: "Hyperparameters were chosen by intuition." }
+raft integration invoke --service raft-review --action suggest_edit --param thread_id=<id> \
+  --param replacement=@new.tex --param rationale="State the search space."
+```
+
+Use `--param quote=<exact LaTeX>` to replace only part of the mapped span, and
+`--param path=<file>` to edit a different file than the one the comment maps to.
+You can also start your own thread by quoting LaTeX with `create_thread`
+(`quote` is searched in the sources first, then in the PDF).
+
+**Sync accepted changes back to the repo.** After the human accepts edits:
+
+```sh
+raft integration invoke --service raft-review --action get_patch \
+  --param document_id=<id> --param from=<last version you synced> --output review.patch
+git apply review.patch && git commit -am "Apply review changes (Raft Review v<n>)"
+```
+
+`get_document` shows `current_version`; remember it as your next `from`. If you
+change the paper outside the review, push the new state with `upload_sources`
+(comments re-anchor; the PDF recompiles).
+
+**Compiling.** If the server compiles (the usual setup), nothing to do; when a
+compile fails you're woken with `get_compile_log`. If you're woken with
+"accepted edits … compile, then upload_pdf", the server has no compiler: apply
+the patch, build (`latexmk -pdf -synctex=1 main.tex`, or
+`tectonic -X compile main.tex --synctex`), then:
+
+```sh
+base64 < main.pdf > main.pdf.b64; base64 < main.synctex.gz > main.synctex.b64
+raft integration invoke --service raft-review --action upload_pdf --param document_id=<id> \
+  --param pdf_base64=@main.pdf.b64 --param synctex_base64=@main.synctex.b64
+```
+
+Sending SyncTeX makes PDF→LaTeX mapping exact even for repeated phrases.
+
+## Plain PDFs
+
+A PDF uploaded on its own (no LaTeX) can be commented on but not edited:
+accepting a suggestion records it, and the human gets a checklist to apply in
+the source. Upload the LaTeX project instead whenever you have it.
 
 ## Raw text and offsets
 

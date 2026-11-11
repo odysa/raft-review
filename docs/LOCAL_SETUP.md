@@ -14,6 +14,9 @@ Three ways to run Raft Review on your machine, from quickest to most complete:
   built-in `node:sqlite` and runs TypeScript directly, so it has no build step and no
   runtime dependencies.
 - **git**
+- For research papers: **[Tectonic](https://tectonic-typesetting.github.io)**, so
+  the server can compile LaTeX (`brew install tectonic`, or see its install page).
+  Without it, papers still work, but the agent compiles and uploads the PDF.
 - For B and C: an HTTPS tunnel such as [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
   (`brew install cloudflared`). The Raft CLI fetches the agent manifest over HTTPS only.
 
@@ -21,7 +24,7 @@ Three ways to run Raft Review on your machine, from quickest to most complete:
 git clone https://github.com/odysa/raft-review.git
 cd raft-review
 npm install          # dev tooling only: typescript + @types/node
-npm test             # 28 tests: anchoring, review logic, end-to-end against a mock Raft API
+npm test             # 40 tests, including real LaTeX compiles when Tectonic is installed
 ```
 
 ---
@@ -65,6 +68,31 @@ as a **human** or as an **agent** without Raft. It is only available when
 
 5. The human window updates live. Hover the suggestion to preview it inline, then
    **Accept** or **Reject**.
+
+### Try a research paper
+
+```bash
+(cd examples/sparse-routing && zip -r ../../sparse-routing.zip .)
+```
+
+1. Signed in as the human, drop `sparse-routing.zip` on the documents page, with `@scribe` as reviewer.
+   The server compiles it in about a second.
+2. Select a sentence in the PDF and click **💬 Comment**. The comment box shows
+   where it lives in the LaTeX (for example `main.tex:14`). Tick **Suggest a LaTeX
+   replacement** to propose an edit yourself.
+3. As the agent, answer with the HTTP calls the actions make:
+
+   ```bash
+   T=$(curl -s -b agent.jar $B/api/inbox | python3 -c "import json,sys;print(json.load(sys.stdin)['pending'][0]['thread_id'])")
+   curl -s -b agent.jar $B/api/threads/$T | python3 -m json.tool | head -40   # source.path / line / quote
+   curl -s -b agent.jar -H 'content-type: application/json' \
+     -d '{"replacement":"We tuned the learning rate on the validation split.","rationale":"State the search."}' \
+     $B/api/threads/$T/suggestions >/dev/null
+   ```
+
+4. Click **Accept**. The banner shows *Compiling v2…*, then the PDF refreshes with
+   the comment on the new sentence. **Changes** shows the patch; `get_patch`
+   returns the same diff for the agent's repository.
 
 The manifest that tells agents about these calls is at
 http://localhost:8787/.well-known/raft-agent-manifest.json, and the agent guide is at

@@ -5,7 +5,8 @@ import { all, run, type Db, type User } from "./db.ts";
 import type { RaftClient } from "./raft.ts";
 import { getUser } from "./review.ts";
 
-export type NotifyReason = "comment" | "new_thread" | "suggestion_accepted" | "suggestion_rejected" | "review_requested";
+export type NotifyReason = "comment" | "new_thread" | "suggestion_accepted" | "suggestion_rejected" | "review_requested"
+  | "pdf_needed" | "compile_failed";
 
 export interface Notifier {
   notify(input: {
@@ -32,6 +33,8 @@ const REASON_TEXT: Record<NotifyReason, string> = {
   suggestion_accepted: "accepted your suggestion in",
   suggestion_rejected: "rejected your suggestion in",
   review_requested: "asked you to review",
+  pdf_needed: "accepted edits to the LaTeX of",
+  compile_failed: "accepted edits, but the PDF failed to compile, in",
 };
 
 /** Wakes the reviewing agent through Raft's Agent Events API. The event tells
@@ -56,9 +59,14 @@ export function createRaftNotifier(db: Db, config: Config, raft: RaftClient): No
         return { status: "disabled", detail: "dev mode: no Raft credentials, agent must poll list_pending" };
       }
       const svc = JSON.stringify(config.serviceKey);
-      const target = input.threadId
-        ? `raft integration invoke --service ${svc} --action get_thread --param thread_id=${input.threadId}`
-        : `raft integration invoke --service ${svc} --action get_document --param document_id=${input.documentId}`;
+      const doc = `--param document_id=${input.documentId}`;
+      const target = input.reason === "pdf_needed"
+        ? `raft integration invoke --service ${svc} --action get_patch ${doc} --output review.patch; git apply it, compile, then upload_pdf ${doc} --param pdf_base64=@main.pdf.b64`
+        : input.reason === "compile_failed"
+          ? `raft integration invoke --service ${svc} --action get_compile_log ${doc}`
+          : input.threadId
+            ? `raft integration invoke --service ${svc} --action get_thread --param thread_id=${input.threadId}`
+            : `raft integration invoke --service ${svc} --action get_document ${doc}`;
       const summary = clip(
         `${input.actor.name} ${REASON_TEXT[input.reason]} “${clip(input.documentTitle, 80)}”`
           + (input.body ? `: “${clip(input.body, 200)}”` : "")

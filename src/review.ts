@@ -26,6 +26,17 @@ import {
   type User,
   type VersionRow,
 } from "./db.ts";
+import {
+  acceptPaperSuggestion,
+  createPaperSuggestion,
+  createPaperThread,
+  deleteOrphanBlobs,
+  paperInfo,
+  sourceContext,
+  sourceFilesFor,
+  sourceView,
+  suggestionLine,
+} from "./paper.ts";
 
 export class ReviewError extends Error {
   status: number;
@@ -40,11 +51,11 @@ export class ReviewError extends Error {
 const MAX_BODY = 20_000;
 const MAX_TITLE = 200;
 
-function now(): number {
+export function now(): number {
   return Date.now();
 }
 
-function requireText(value: unknown, field: string, max = MAX_BODY): string {
+export function requireText(value: unknown, field: string, max = MAX_BODY): string {
   if (typeof value !== "string" || !value.trim()) throw new ReviewError(400, "invalid_request", `${field} is required`);
   if (value.length > max) throw new ReviewError(400, "invalid_request", `${field} is too long (max ${max} characters)`);
   return value;
@@ -87,7 +98,7 @@ export function listAgents(db: Db, serverId: string): User[] {
 
 // ---------- documents ----------
 
-function loadDocument(db: Db, user: User, documentId: string): DocumentRow {
+export function loadDocument(db: Db, user: User, documentId: string): DocumentRow {
   const doc = get<DocumentRow & { server_id: string }>(
     db,
     `SELECT d.*, u.server_id AS server_id FROM documents d JOIN users u ON u.id = d.created_by WHERE d.id = ?`,
@@ -98,7 +109,7 @@ function loadDocument(db: Db, user: User, documentId: string): DocumentRow {
   return doc;
 }
 
-function currentVersion(db: Db, doc: DocumentRow): VersionRow {
+export function currentVersion(db: Db, doc: DocumentRow): VersionRow {
   const version = get<VersionRow>(
     db,
     "SELECT * FROM versions WHERE document_id = ? AND version = ?",
@@ -108,7 +119,7 @@ function currentVersion(db: Db, doc: DocumentRow): VersionRow {
   return version;
 }
 
-function requireReviewer(db: Db, user: User, agentId: string | null | undefined): string | null {
+export function requireReviewer(db: Db, user: User, agentId: string | null | undefined): string | null {
   if (!agentId) return null;
   const agent = getUser(db, agentId);
   if (!agent || agent.type !== "agent" || agent.server_id !== user.server_id) {
@@ -178,6 +189,7 @@ export function deleteDocument(db: Db, user: User, documentId: string): void {
     throw new ReviewError(403, "forbidden", "only a human or the uploader can delete a document");
   }
   run(db, "DELETE FROM documents WHERE id = ?", doc.id);
+  if (doc.kind === "paper") deleteOrphanBlobs(db);
 }
 
 export function getFile(db: Db, user: User, documentId: string, version?: number): { doc: DocumentRow; version: VersionRow } {
@@ -200,6 +212,7 @@ export function addVersion(db: Db, user: User, documentId: string, input: {
   note?: unknown;
 }): DocumentRow {
   const doc = loadDocument(db, user, documentId);
+  if (doc.kind === "paper") throw new ReviewError(400, "use_sources", "a paper gets new versions through its sources (upload_sources)");
   const text = typeof input.text === "string" ? input.text : "";
   if (doc.kind === "pdf" && !input.file) throw new ReviewError(400, "invalid_request", "a PDF version needs the file bytes");
   if (doc.kind !== "pdf" && !text) throw new ReviewError(400, "invalid_request", "text is required");
@@ -242,7 +255,7 @@ export function addVersion(db: Db, user: User, documentId: string, input: {
 
 // ---------- threads ----------
 
-function loadThread(db: Db, user: User, threadId: string): { thread: ThreadRow; doc: DocumentRow } {
+export function loadThread(db: Db, user: User, threadId: string): { thread: ThreadRow; doc: DocumentRow } {
   const thread = get<ThreadRow>(db, "SELECT * FROM threads WHERE id = ?", threadId);
   if (!thread) throw new ReviewError(404, "not_found", "thread not found");
   const doc = loadDocument(db, user, thread.document_id);
@@ -287,6 +300,7 @@ export function createThread(db: Db, user: User, documentId: string, input: Anch
   rationale?: unknown;
 }): ThreadRow {
   const doc = loadDocument(db, user, documentId);
+  if (doc.kind === "paper") return createPaperThread(db, user, doc, input);
   const { text } = currentVersion(db, doc);
   const span = resolveAnchor(text, input);
   const body = requireText(input.body, "body");
@@ -309,25 +323,25 @@ export function createThread(db: Db, user: User, documentId: string, input: Anch
   return get<ThreadRow>(db, "SELECT * FROM threads WHERE id = ?", id)!;
 }
 
-function insertComment(db: Db, threadId: string, authorId: string, body: string, t: number): CommentRow {
+export function insertComment(db: Db, threadId: string, authorId: string, body: string, t: number): CommentRow {
   const id = randomUUID();
   run(db, "INSERT INTO comments (id, thread_id, author_id, body, created_at) VALUES (?, ?, ?, ?, ?)", id, threadId, authorId, body, t);
   return { id, thread_id: threadId, author_id: authorId, body, created_at: t };
 }
 
-function insertSuggestion(
+export function insertSuggestion(
   db: Db, threadId: string, authorId: string, span: Span, original: string,
-  replacement: string, rationale: unknown, t: number,
+  replacement: string, rationale: unknown, t: number, path: string | null = null,
 ): string {
   if (replacement.length > 200_000) throw new ReviewError(400, "invalid_request", "replacement is too long");
   if (replacement === original) throw new ReviewError(400, "invalid_request", "replacement is identical to the original text");
   const id = randomUUID();
   run(
     db,
-    `INSERT INTO suggestions (id, thread_id, author_id, start, "end", original, replacement, rationale, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    `INSERT INTO suggestions (id, thread_id, author_id, start, "end", original, replacement, rationale, status, created_at, path)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
     id, threadId, authorId, span.start, span.end, original, replacement,
-    typeof rationale === "string" ? rationale.slice(0, MAX_BODY) : "", t,
+    typeof rationale === "string" ? rationale.slice(0, MAX_BODY) : "", t, path,
   );
   return id;
 }
@@ -358,7 +372,7 @@ export function setThreadStatus(db: Db, user: User, threadId: string, status: "o
 
 // ---------- suggestions ----------
 
-function pendingSuggestions(db: Db, documentId: string): SuggestionRow[] {
+export function pendingSuggestions(db: Db, documentId: string): SuggestionRow[] {
   return all<SuggestionRow>(
     db,
     `SELECT s.* FROM suggestions s JOIN threads t ON t.id = s.thread_id WHERE t.document_id = ? AND s.status = 'pending'`,
@@ -373,8 +387,10 @@ export function createSuggestion(db: Db, user: User, threadId: string, input: {
   quote?: unknown;
   occurrence?: unknown;
   rationale?: unknown;
+  path?: unknown;
 }): SuggestionRow {
   const { thread, doc } = loadThread(db, user, threadId);
+  if (doc.kind === "paper") return createPaperSuggestion(db, user, thread, doc, input);
   if (thread.status === "orphaned") throw new ReviewError(409, "orphaned", "the thread's text no longer exists");
   if (typeof input.replacement !== "string") throw new ReviewError(400, "invalid_request", "replacement is required (may be empty to delete)");
   const { text } = currentVersion(db, doc);
@@ -395,9 +411,11 @@ export function createSuggestion(db: Db, user: User, threadId: string, input: {
   return get<SuggestionRow>(db, "SELECT * FROM suggestions WHERE id = ?", id)!;
 }
 
-export function decideSuggestion(db: Db, user: User, suggestionId: string, decision: "accept" | "reject"): {
+export function decideSuggestion(db: Db, user: User, suggestionId: string, decision: "accept" | "reject", opts: { compilerAvailable?: boolean } = {}): {
   suggestion: SuggestionRow;
   document: DocumentRow;
+  /** Papers: the new version that needs a PDF. */
+  compileVersion?: number;
 } {
   const suggestion = get<SuggestionRow>(db, "SELECT * FROM suggestions WHERE id = ?", suggestionId);
   if (!suggestion) throw new ReviewError(404, "not_found", "suggestion not found");
@@ -406,6 +424,14 @@ export function decideSuggestion(db: Db, user: User, suggestionId: string, decis
     throw new ReviewError(403, "human_decision", "only a human reviewer can accept or reject suggestions");
   }
   if (suggestion.status !== "pending") throw new ReviewError(409, "already_decided", `suggestion is already ${suggestion.status}`);
+  if (doc.kind === "paper" && decision === "accept" && suggestion.path) {
+    const compileVersion = acceptPaperSuggestion(db, user, doc, suggestion, opts.compilerAvailable ?? false);
+    return {
+      suggestion: get<SuggestionRow>(db, "SELECT * FROM suggestions WHERE id = ?", suggestion.id)!,
+      document: loadDocument(db, user, doc.id),
+      compileVersion,
+    };
+  }
   const t = now();
 
   if (decision === "reject") {
@@ -457,19 +483,19 @@ export function decideSuggestion(db: Db, user: User, suggestionId: string, decis
   };
 }
 
-function clip(value: string, max: number): string {
+export function clip(value: string, max: number): string {
   const flat = value.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
 // ---------- views ----------
 
-function authorView(db: Db, id: string) {
+export function authorView(db: Db, id: string) {
   const u = getUser(db, id);
   return u ? { id: u.id, type: u.type, name: u.name, username: u.username, avatar_url: u.avatar_url } : { id, type: "human", name: "Unknown", username: "unknown", avatar_url: null };
 }
 
-export function threadView(db: Db, thread: ThreadRow, text: string, kind: DocKind) {
+export function threadView(db: Db, thread: ThreadRow, text: string, kind: DocKind, files: Map<string, string> | null = null) {
   const comments = all<CommentRow>(db, "SELECT * FROM comments WHERE thread_id = ? ORDER BY created_at, rowid", thread.id);
   const suggestions = all<SuggestionRow>(db, "SELECT * FROM suggestions WHERE thread_id = ? ORDER BY created_at, rowid", thread.id);
   return {
@@ -481,8 +507,9 @@ export function threadView(db: Db, thread: ThreadRow, text: string, kind: DocKin
       start: thread.start,
       end: thread.end,
       quote: thread.quote,
-      ...(kind === "pdf" ? { page: pageOf(text, thread.start) } : { line: lineOf(text, thread.start) }),
+      ...(kind === "pdf" || kind === "paper" ? { page: pageOf(text, thread.start) } : { line: lineOf(text, thread.start) }),
     },
+    ...(kind === "paper" ? { source: sourceView(thread, files) } : {}),
     created_by: authorView(db, thread.created_by),
     created_at: thread.created_at,
     updated_at: thread.updated_at,
@@ -499,6 +526,7 @@ export function threadView(db: Db, thread: ThreadRow, text: string, kind: DocKin
       decided_by: s.decided_by ? authorView(db, s.decided_by) : null,
       decided_at: s.decided_at,
       created_at: s.created_at,
+      ...(s.path ? { path: s.path, line: suggestionLine(files, s) } : {}),
     })),
   };
 }
@@ -506,6 +534,7 @@ export function threadView(db: Db, thread: ThreadRow, text: string, kind: DocKin
 export function documentView(db: Db, user: User, documentId: string, opts: { includeText?: boolean } = {}) {
   const doc = loadDocument(db, user, documentId);
   const version = currentVersion(db, doc);
+  const files = sourceFilesFor(db, doc);
   const threads = all<ThreadRow>(db, "SELECT * FROM threads WHERE document_id = ? ORDER BY start, created_at", doc.id);
   const versions = all<{ version: number; note: string; created_by: string; created_at: number }>(
     db, "SELECT version, note, created_by, created_at FROM versions WHERE document_id = ? ORDER BY version DESC", doc.id,
@@ -521,8 +550,9 @@ export function documentView(db: Db, user: User, documentId: string, opts: { inc
     created_at: doc.created_at,
     updated_at: doc.updated_at,
     ...(opts.includeText === false ? {} : { text: version.text }),
+    ...(doc.kind === "paper" ? { paper: paperInfo(db, doc, version) } : {}),
     versions: versions.map((v) => ({ version: v.version, note: v.note, created_by: authorView(db, v.created_by), created_at: v.created_at })),
-    threads: threads.map((thread) => threadView(db, thread, version.text, doc.kind)),
+    threads: threads.map((thread) => threadView(db, thread, version.text, doc.kind, files)),
   };
 }
 
@@ -530,10 +560,12 @@ export function documentView(db: Db, user: User, documentId: string, opts: { inc
 export function threadDetail(db: Db, user: User, threadId: string) {
   const { thread, doc } = loadThread(db, user, threadId);
   const { text } = currentVersion(db, doc);
+  const files = sourceFilesFor(db, doc);
   return {
-    document: { id: doc.id, title: doc.title, kind: doc.kind, filename: doc.filename, current_version: doc.current_version },
+    document: { id: doc.id, title: doc.title, kind: doc.kind, filename: doc.filename, current_version: doc.current_version, main_path: doc.main_path },
     context: contextAround(text, thread),
-    thread: threadView(db, thread, text, doc.kind),
+    ...(doc.kind === "paper" ? { source_context: sourceContext(db, doc, thread) } : {}),
+    thread: threadView(db, thread, text, doc.kind, files),
   };
 }
 

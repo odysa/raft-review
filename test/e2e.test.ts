@@ -115,6 +115,7 @@ before(async () => {
     raftServerId: SERVER_ID, dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID,
     membershipTtlMs: 0, // re-verify with Raft on every request in tests
     webhookSecrets: [WEBHOOK_SECRET, "raft_webhook_secret_previous"],
+    compiler: "none", compileTimeoutMs: 60_000, compileConcurrency: 1, tectonicOnlyCached: false,
   };
   app = createApp(config, { db: openDb(":memory:") });
 });
@@ -244,7 +245,8 @@ test("without RAFT_SERVER_ID the app learns the server from the first human", as
   await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
   const base2 = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
   app2 = createApp({ port: 0, publicUrl: base2, raftApiUrl: raftUrl, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
-    raftServerId: "", dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID, webhookSecrets: [] }, { db });
+    raftServerId: "", dataDir: ":memory:", devLogin: false, serviceKey: CLIENT_ID, webhookSecrets: [],
+    compiler: "none", compileTimeoutMs: 60_000, compileConcurrency: 1, tectonicOnlyCached: false }, { db });
   try {
     const early = await fetch(`${base2}/auth/callback?code=login-req`, { redirect: "manual" });
     assert.equal(early.status, 409);
